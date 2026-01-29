@@ -19,7 +19,8 @@ CONSOLE = Console(width=120)
 import h5py
 import os
 import os.path as osp
-
+import os, json, numpy as np
+import torch
 
 import numpy as np
 from nerfstudio.data.datamanagers.base_datamanager import (
@@ -79,31 +80,100 @@ class GarfieldDataManager(VanillaDataManager):  # pylint: disable=abstract-metho
         self.group_cdf = None
         self.scale_3d_statistics = None
 
+        # try to load a lightweight index on init so next_group can lazy-load per-image npz files.
+        # If a full hdf5 is present but very large, prefer lazy loading instead of populating nested tensors.
+        try:
+            # If there is an hdf5 sam_data file, decide whether to load it fully or lazily.
+            if osp.exists(self.sam_data_path):
+                # inexpensive probe: check number of images in file (if prefix exists)
+                try:
+                    with h5py.File(self.sam_data_path, "r") as f:
+                        prefix = self.img_group_model.config.model_type
+                        if prefix in f and "pixel_level_keys" in f[prefix].keys():
+                            num_entries = len(list(f[prefix]["pixel_level_keys"].keys()))
+                        else:
+                            num_entries = 0
+                except Exception:
+                    num_entries = 0
+
+                # threshold: if many images, use lazy loading to avoid OOM
+                LAZY_LOAD_THRESHOLD = 200  # tune: lower if your memory is smaller
+                if num_entries == 0 or num_entries > LAZY_LOAD_THRESHOLD:
+                    # prefer lazy per-image loading (uses per-image npz index if available)
+                    # create sam_cache dir if present and load lazy index
+                    _ = self.load_sam_data_lazy()
+                else:
+                    # dataset small enough: attempt the existing full load path to populate nested tensors
+                    _ = self.load_sam_data()
+            else:
+                # no sam_data.hdf5: try lazy index if it exists on disk
+                _ = self.load_sam_data_lazy()
+        except Exception:
+            # never crash the constructor; fallback to lazy mode
+            self.pixel_level_keys = None
+            self.scale_3d = None
+            self.group_cdf = None
+            self.load_sam_data_lazy()
+        # --- Prevent full-image RAM caching which causes OOM on large datasets ---
+        # Many nerfstudio dataparser implementations either expose:
+        #  - dataparser.cache_images (bool), or
+        #  - dataparser.config.cache_images (bool)
+        # Setting these to False prevents the dataparser from keeping all undistorted
+        # images in RAM; images will be read/processed on demand instead.
+        try:
+            if hasattr(self, "dataparser"):
+                # prefer explicit attribute if available
+                if hasattr(self.dataparser, "cache_images"):
+                    self.dataparser.cache_images = False
+                # some code paths use a config object
+                if hasattr(self.dataparser, "config") and hasattr(self.dataparser.config, "cache_images"):
+                    self.dataparser.config.cache_images = False
+        except Exception:
+            # best-effort — do not break initialization if dataparser shape differs
+            pass
+
     def load_sam_data(self) -> bool:
         """
         Loads the SAM data (masks, 3D scales, etc.) through hdf5.
         If the file doesn't exist, returns False.
         """
         prefix = self.img_group_model.config.model_type
-        if osp.exists(self.sam_data_path):
-            sam_data = h5py.File(self.sam_data_path, "r")
-            if prefix not in sam_data.keys():
-                return False
+        if not osp.exists(self.sam_data_path):
+            return False
 
-            sam_data = sam_data[prefix]
+        # quick probe to avoid huge memory allocation
+        try:
+            with h5py.File(self.sam_data_path, "r") as f:
+                if prefix not in f:
+                    return False
+                num_entries = len(list(f[prefix]["pixel_level_keys"].keys()))
+        except Exception:
+            return False
 
-            pixel_level_keys_list, scales_3d_list, group_cdf_list = [], [], []
+        # If very many images, prefer lazy loading to avoid OOM
+        LAZY_LOAD_THRESHOLD = 200  # same threshold as in __init__; tune to your memory
+        if num_entries > LAZY_LOAD_THRESHOLD:
+            return False
 
-            num_entries = len(sam_data["pixel_level_keys"].keys())
-            for i in range(num_entries):
-                pixel_level_keys_list.append(
-                    torch.from_numpy(sam_data["pixel_level_keys"][str(i)][...])
-                )
-            self.pixel_level_keys = torch.nested.nested_tensor(pixel_level_keys_list)
-            del pixel_level_keys_list
+        # If we're here, dataset is small enough — proceed with the original load behavior
+        sam_data = h5py.File(self.sam_data_path, "r")
+        if prefix not in sam_data.keys():
+            return False
 
-            for i in range(num_entries):
-                scales_3d_list.append(torch.from_numpy(sam_data["scale_3d"][str(i)][...]))
+        sam_data = sam_data[prefix]
+
+        pixel_level_keys_list, scales_3d_list, group_cdf_list = [], [], []
+
+        num_entries = len(sam_data["pixel_level_keys"].keys())
+        for i in range(num_entries):
+            pixel_level_keys_list.append(
+                torch.from_numpy(sam_data["pixel_level_keys"][str(i)][...])
+            )
+        self.pixel_level_keys = torch.nested.nested_tensor(pixel_level_keys_list)
+        del pixel_level_keys_list
+
+        for i in range(num_entries):
+            scales_3d_list.append(torch.from_numpy(sam_data["scale_3d"][str(i)][...]))
             self.scale_3d = torch.nested.nested_tensor(scales_3d_list)
             self.scale_3d_statistics = torch.cat(scales_3d_list)
             del scales_3d_list
@@ -262,79 +332,220 @@ class GarfieldDataManager(VanillaDataManager):  # pylint: disable=abstract-metho
         return (pixel_level_keys.cpu(), scale.cpu(), mask_cdf.cpu())
 
     def next_group(self, ray_bundle: RayBundle, batch: Dict[str, Any]):
-        """Returns the rays' mask and 3D scales for grouping.
-        We add to `batch` the following:
-            - "mask_id": [batch_size,]
-            - "scale": [batch_size,]
-            - "nPxImg": int == `num_rays_per_image`
-        This function also adds `scale` to `ray_bundle.metadata`.
-
-        We're using torch nested tensors -- this means that it's difficult to index into them.
-        At least now, it seems possible to index normally into a leaf tensor.
-        """
+        """Returns the rays' mask and 3D scales for grouping (memory-safe lazy loads)."""
         indices = batch["indices"].long().detach().cpu()
         npximg = self.train_pixel_sampler.num_rays_per_image
         img_ind = indices[:, 0]
         x_ind = indices[:, 1]
         y_ind = indices[:, 2]
 
-        # sampled_imgs = img_ind[::npximg]
         mask_id = torch.zeros((indices.shape[0],), device=self.device)
         scale = torch.zeros((indices.shape[0],), device=self.device)
 
         random_vec_sampling = (torch.rand((1,)) * torch.ones((npximg,))).view(-1, 1)
         random_vec_densify = (torch.rand((1,)) * torch.ones((npximg,))).view(-1, 1)
 
-        for i in range(0, indices.shape[0], npximg):
-            img_idx = img_ind[i]
+        # helper to get per-image arrays (either from in-memory nested tensor or from disk)
+        def _get_image_sam_arrays(i):
+            # If fully loaded in memory (old behaviour)
+            if (
+                getattr(self, "pixel_level_keys", None) is not None
+                and getattr(self, "scale_3d", None) is not None
+                and getattr(self, "group_cdf", None) is not None
+            ):
+                per_pixel_keys = self.pixel_level_keys[i]  # nested tensor leaf
+                per_scale = self.scale_3d[i]
+                per_cdf = self.group_cdf[i]
+                return per_pixel_keys, per_scale, per_cdf
 
-            # Use `random_vec` to choose a group for each pixel.
-            per_pixel_index = self.pixel_level_keys[img_idx][
-                x_ind[i : i + npximg], y_ind[i : i + npximg]
-            ]
+            # Else try lazy load from disk using datamanager helper
+            try:
+                arrs = self.load_sam_for_image(int(i))
+            except Exception:
+                arrs = None
+            if arrs is None or arrs[0] is None:
+                # fallback: single dummy mask (very small, safe)
+                per_pixel_keys = torch.full((1, 1, 1), -1, dtype=torch.int)
+                per_scale = torch.zeros((1, 1))
+                per_cdf = torch.ones((1, 1))
+                return per_pixel_keys, per_scale, per_cdf
+
+            pixel_level_keys_np, scale_3d_np, group_cdf_np = arrs
+            per_pixel_keys = torch.from_numpy(pixel_level_keys_np).long()
+            per_scale = torch.from_numpy(scale_3d_np).float()
+            per_cdf = torch.from_numpy(group_cdf_np).float()
+            return per_pixel_keys, per_scale, per_cdf
+
+        # process rays in chunks of npximg
+        for i in range(0, indices.shape[0], npximg):
+            img_idx = int(img_ind[i].item())
+            per_pixel_index, per_scale_tensor, per_group_cdf = _get_image_sam_arrays(img_idx)
+            per_pixel_index_slice = per_pixel_index[x_ind[i : i + npximg], y_ind[i : i + npximg]]
             random_index = torch.sum(
                 random_vec_sampling.view(-1, 1)
-                > self.group_cdf[img_idx][x_ind[i : i + npximg], y_ind[i : i + npximg]],
+                > per_group_cdf[x_ind[i : i + npximg], y_ind[i : i + npximg]],
                 dim=-1,
             )
 
-            # `per_pixel_index` encodes the list of groups that each pixel belongs to.
-            # If there's only one group, then `per_pixel_index` is a 1D tensor
-            # -- this will mess up the future `gather` operations.
-            if per_pixel_index.shape[-1] == 1:
-                per_pixel_mask = per_pixel_index.squeeze()
+            # handle single-mask case
+            if per_pixel_index_slice.dim() == 1 or per_pixel_index_slice.shape[-1] == 1:
+                per_pixel_mask = per_pixel_index_slice.squeeze()
+                per_pixel_mask_ = per_pixel_mask.clone()
             else:
                 per_pixel_mask = torch.gather(
-                    per_pixel_index, 1, random_index.unsqueeze(-1)
+                    per_pixel_index_slice, 1, random_index.unsqueeze(-1)
                 ).squeeze()
                 per_pixel_mask_ = torch.gather(
-                    per_pixel_index,
+                    per_pixel_index_slice,
                     1,
-                    torch.max(random_index.unsqueeze(-1) - 1, torch.Tensor([0]).int()),
+                    torch.max(random_index.unsqueeze(-1) - 1, torch.tensor([0], dtype=torch.long)),
                 ).squeeze()
 
             mask_id[i : i + npximg] = per_pixel_mask.to(self.device)
 
             # interval scale supervision
-            curr_scale = self.scale_3d[img_idx][per_pixel_mask]
-            curr_scale[random_index == 0] = (
-                self.scale_3d[img_idx][per_pixel_mask][random_index == 0]
-                * random_vec_densify[random_index == 0]
-            )
-            for j in range(1, self.group_cdf[img_idx].shape[-1]):
-                if (random_index == j).sum() == 0:
+            # gather scales for chosen masks
+            curr_scale = per_scale_tensor[per_pixel_mask.long()].squeeze()
+            if curr_scale.dim() == 0:
+                curr_scale = curr_scale.unsqueeze(0)
+            curr_scale = curr_scale.clone()
+            # densify where random_index == 0
+            mask0 = (random_index == 0)
+            if mask0.any():
+                curr_scale[mask0] = (
+                    per_scale_tensor[per_pixel_mask.long()][mask0]
+                    * random_vec_densify[mask0]
+                ).squeeze()
+            # handle other indices if multiple masks per pixel
+            max_cdf_len = per_group_cdf.shape[-1] if per_group_cdf.ndim == 3 else 1
+            for j in range(1, max_cdf_len):
+                mask_j = (random_index == j)
+                if mask_j.sum() == 0:
                     continue
-                curr_scale[random_index == j] = (
-                    self.scale_3d[img_idx][per_pixel_mask_][random_index == j]
+                val = (
+                    per_scale_tensor[per_pixel_mask_.long()][mask_j]
                     + (
-                        self.scale_3d[img_idx][per_pixel_mask][random_index == j]
-                        - self.scale_3d[img_idx][per_pixel_mask_][random_index == j]
+                        per_scale_tensor[per_pixel_mask.long()][mask_j]
+                        - per_scale_tensor[per_pixel_mask_.long()][mask_j]
                     )
-                    * random_vec_densify[random_index == j]
+                    * random_vec_densify[mask_j]
                 )
-            scale[i : i + npximg] = curr_scale.squeeze().to(self.device)
+                curr_scale[mask_j] = val.squeeze()
+
+            scale[i : i + npximg] = curr_scale.to(self.device)
 
         batch["mask_id"] = mask_id
         batch["scale"] = scale
         batch["nPxImg"] = npximg
         ray_bundle.metadata["scale"] = batch["scale"]
+
+
+
+    def save_sam_data_single(self, idx, pixel_level_keys, scale_3d, group_cdf):
+        """
+        Save per-image grouping output to disk as compressed npz.
+        Call: self.save_sam_data_single(i, pixel_level_keys, scale_3d, group_cdf)
+        """
+        import os, json, numpy as _np
+
+        # ensure cache dir
+        cache_dir = getattr(self, "sam_cache_dir", None)
+        if cache_dir is None:
+            data_root = getattr(self.dataparser, "data", "data")
+            cache_dir = os.path.join(str(data_root), "sam_cache")
+            self.sam_cache_dir = cache_dir
+        os.makedirs(self.sam_cache_dir, exist_ok=True)
+
+        # build output file name
+        out_name = os.path.join(self.sam_cache_dir, f"sam_{int(idx):06d}.npz")
+
+        # Convert tensors to CPU numpy (single-image conversion)
+        def _to_np(x):
+            try:
+                return x.detach().cpu().numpy()
+            except Exception:
+                return _np.array(x)
+
+        _np.savez_compressed(
+            out_name,
+            pixel_level_keys=_to_np(pixel_level_keys),
+            scale_3d=_to_np(scale_3d),
+            group_cdf=_to_np(group_cdf),
+        )
+
+        # update index (append entry)
+        idx_file = os.path.join(self.sam_cache_dir, "index.json")
+        try:
+            if os.path.exists(idx_file):
+                with open(idx_file, "r") as f:
+                    idxd = json.load(f)
+            else:
+                idxd = {}
+            idxd[str(int(idx))] = os.path.basename(out_name)
+            with open(idx_file, "w") as f:
+                json.dump(idxd, f)
+        except Exception:
+            # best-effort index writing; don't crash training
+            pass
+
+    def save_sam_index(self):
+        """
+        Ensure index exists; no-op if save_sam_data_single already wrote index.json entries.
+        """
+        cache_dir = getattr(self, "sam_cache_dir", None)
+        if cache_dir is None:
+            return
+        idx_file = os.path.join(cache_dir, "index.json")
+        if not os.path.exists(idx_file):
+            # create empty index mapping if none
+            with open(idx_file, "w") as f:
+                json.dump({}, f)
+
+    def load_sam_data_lazy(self):
+        """
+        Load only the index (list of per-image files). This function does not load the npz mask arrays.
+        Subsequent code should read per-image npz files on demand.
+        """
+        cache_dir = getattr(self, "sam_cache_dir", None)
+        if cache_dir is None:
+            data_root = getattr(self.dataparser, "data", "data")
+            cache_dir = os.path.join(str(data_root), "sam_cache")
+            self.sam_cache_dir = cache_dir
+        idx_file = os.path.join(self.sam_cache_dir, "index.json")
+        if not os.path.exists(idx_file):
+            # no precomputed masks available
+            self.sam_index = {}
+            return False
+        try:
+            with open(idx_file, "r") as f:
+                self.sam_index = json.load(f)
+            return True
+        except Exception:
+            self.sam_index = {}
+            return False
+
+    def load_sam_for_image(self, idx):
+        """
+        datamanager method: returns pixel_level_keys, scale_3d, group_cdf for a single image
+        index by loading its npz file.
+        """
+        import os, numpy as _np, json as _json
+        cache_dir = getattr(self, "sam_cache_dir", None)
+        if cache_dir is None:
+            data_root = getattr(self.dataparser, "data", "data")
+            cache_dir = os.path.join(str(data_root), "sam_cache")
+            self.sam_cache_dir = cache_dir
+        idx_file = os.path.join(self.sam_cache_dir, "index.json")
+        if not os.path.exists(idx_file):
+            return None, None, None
+        try:
+            with open(idx_file, "r") as f:
+                idxd = _json.load(f)
+        except Exception:
+            return None, None, None
+        fn = idxd.get(str(int(idx)))
+        if fn is None:
+            return None, None, None
+        data = _np.load(os.path.join(self.sam_cache_dir, fn), allow_pickle=True)
+        return data["pixel_level_keys"], data["scale_3d"], data["group_cdf"]
+
