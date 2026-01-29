@@ -26,8 +26,8 @@ class ImgGroupModelConfig(cfg.InstantiateConfig):
      - "maskformer": MaskFormer model from huggingface (experimental)
     """
 
-    sam_model_type: str = ""
-    sam_model_ckpt: str = ""
+    sam_model_type: str = "vit_b"
+    sam_model_ckpt: str = "/home/eaghae1/SAM-Adapter-PyTorch/save/_cod-sam-vit-b/model_epoch_best.pth"
     sam_kwargs: dict = field(default_factory=lambda: {})
     "Arguments for SAM model (fb)."
 
@@ -41,7 +41,7 @@ class ImgGroupModelConfig(cfg.InstantiateConfig):
     #     "stability_score_thresh": 0.90,
     # },
 
-    device: Union[torch.device, str] = ("cpu",)
+    device: Union[torch.device, str] = ("cuda",)
 
 
 class ImgGroupModel:

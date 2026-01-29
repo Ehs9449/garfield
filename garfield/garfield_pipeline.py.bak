@@ -12,6 +12,7 @@ from sklearn.preprocessing import QuantileTransformer
 from garfield.garfield_datamanager import GarfieldDataManagerConfig, GarfieldDataManager
 from garfield.garfield_model import GarfieldModel, GarfieldModelConfig
 
+
 @dataclass
 class GarfieldPipelineConfig(VanillaPipelineConfig):
     """Configuration for GARField pipeline instantiation"""
@@ -26,6 +27,7 @@ class GarfieldPipelineConfig(VanillaPipelineConfig):
     max_grouping_scale: float = 2.0
     num_rays_per_image: int = 256
     normalize_grouping_scale: bool = True
+
 
 class GarfieldPipeline(VanillaPipeline):
     config: GarfieldPipelineConfig
@@ -87,111 +89,62 @@ class GarfieldPipeline(VanillaPipeline):
 
         return model_outputs, loss_dict, metrics_dict
 
-    def populate_grouping_info(self, chunk_size=1, max_sampled_scales=100000, sample_per_image=200):
+    def populate_grouping_info(self):
         """
-        Memory-safe streaming version:
-        - computes per-image pixel_level_keys, scale_3d, group_cdf
-        - saves each image's results to disk as compressed npz via datamanager.save_sam_data_single()
-        - accumulates a limited random sample of scale values to compute grouping_stats (quantiles)
-        - DOES NOT build giant nested tensors for all images at once
+        Calculate groups from SAM and their 3D scales, and save them in the datamanager.
+        This information is required to supervise the grouping field.
         """
-        import os
-        import numpy as np
-        import torch
-        from tqdm import trange
-
+        # Note that pipeline is in train mode here, via the base trainer.
         self.model.eval()
 
+        # Calculate multi-scale masks, and their 3D scales
+        scales_3d_list, pixel_level_keys_list, group_cdf_list = [], [], []
         train_cameras = self.datamanager.train_dataset.cameras
-        n = len(train_cameras)
-        sampled_scales = []
-        total_saved = 0
-
-        # ensure cache dir exists
-        cache_dir = getattr(self.datamanager, "sam_cache_dir", None)
-        if cache_dir is None:
-            # default to a folder next to dataset
-            data_root = getattr(self.datamanager.dataparser, "data", "data")
-            cache_dir = os.path.join(str(data_root), "sam_cache")
-            self.datamanager.sam_cache_dir = cache_dir
-        os.makedirs(self.datamanager.sam_cache_dir, exist_ok=True)
-
-        for i in trange(n, desc="Calculating 3D masks"):
-            # generate rays for camera i
-            camera_ray_bundle = train_cameras.generate_rays(camera_indices=i).to(self.device)
+        for i in tqdm.trange(len(train_cameras), desc="Calculating 3D masks"):
+            camera_ray_bundle = train_cameras.generate_rays(camera_indices=i).to(
+                self.device
+            )
             with torch.no_grad():
-                outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle)
+                outputs = self.model.get_outputs_for_camera_ray_bundle(
+                    camera_ray_bundle
+                )
 
+            # Get RGB (for SAM mask generation), depth and 3D point locations (for 3D scale calculation)
             rgb = self.datamanager.train_dataset[i]["image"]
             depth = outputs["depth"]
             points = camera_ray_bundle.origins + camera_ray_bundle.directions * depth
-
-            # compute per-image groups (this should return reasonably sized tensors for a single image)
-            pixel_level_keys, scale_3d, group_cdf = self.datamanager._calculate_3d_groups(
+            # Scales are capped to `max_grouping_scale` to filter noisy / outlier masks.
+            (
+                pixel_level_keys,
+                scale_3d,
+                group_cdf,
+            ) = self.datamanager._calculate_3d_groups(
                 rgb, depth, points, max_scale=self.config.max_grouping_scale
             )
 
-            # save the per-image data immediately to disk
-            self.datamanager.save_sam_data_single(i, pixel_level_keys, scale_3d, group_cdf)
+            pixel_level_keys_list.append(pixel_level_keys)
+            scales_3d_list.append(scale_3d)
+            group_cdf_list.append(group_cdf)
 
-            # sample scales for global quantile estimation (avoid using all values)
-            try:
-                flat = scale_3d.flatten().detach().cpu().numpy()
-            except Exception:
-                flat = scale_3d.flatten().cpu().numpy()
-            # filter valid range
-            mask = (flat > 0) & (flat < self.config.max_grouping_scale)
-            flat = flat[mask]
-            if flat.size > 0:
-                if flat.size <= sample_per_image:
-                    chosen = flat
-                else:
-                    # random sample without replacement
-                    idx = np.random.choice(flat.size, size=sample_per_image, replace=False)
-                    chosen = flat[idx]
-                sampled_scales.append(chosen)
-                total_saved += chosen.size
+        # Save grouping data, and set it in the datamanager for current training.
+        # This will be cached, so we don't need to calculate it again.
+        self.datamanager.save_sam_data(
+            pixel_level_keys_list, scales_3d_list, group_cdf_list
+        )
+        self.datamanager.pixel_level_keys = torch.nested.nested_tensor(
+            pixel_level_keys_list
+        )
+        self.datamanager.scale_3d = torch.nested.nested_tensor(scales_3d_list)
+        self.datamanager.group_cdf = torch.nested.nested_tensor(group_cdf_list)
 
-                # keep sampled_scales bounded by max_sampled_scales
-                if total_saved > max_sampled_scales:
-                    # trim older samples down proportionally
-                    concatenated = np.concatenate(sampled_scales)
-                    # keep only last max_sampled_scales samples randomly
-                    if concatenated.size > max_sampled_scales:
-                        keep_idx = np.random.choice(concatenated.size, size=max_sampled_scales, replace=False)
-                        concatenated = concatenated[keep_idx]
-                    sampled_scales = [concatenated]
-                    total_saved = concatenated.size
-
-            # clear GPU caches and local refs to be safe
-            try:
-                del outputs, depth, points, pixel_level_keys, scale_3d, group_cdf
-            except Exception:
-                pass
-            torch.cuda.empty_cache()
-
-        # done loop: build grouping_stats from sampled_scales
-        if len(sampled_scales) == 0:
-            # fallback: empty
-            grouping_stats_tensor = torch.zeros(0).to(self.device)
-        else:
-            import numpy as np
-            concat = np.concatenate(sampled_scales)
-            grouping_stats_tensor = torch.from_numpy(concat).float().to(self.device)
-
-        # Save a small metadata index so datamanager knows where files are
-        self.datamanager.save_sam_index()
-
-        # set small sampled grouping stats for quantile transformer
-        self.grouping_stats = torch.nn.Parameter(grouping_stats_tensor)
-        self.model.grouping_field.quantile_transformer = self._get_quantile_func(grouping_stats_tensor)
-
-        # Set datamanager to lazy load from saved files (datamanager should implement loading)
-        self.datamanager.load_sam_data_lazy()
+        # Initialize grouping statistics. This will be automatically loaded from a checkpoint next time.
+        self.grouping_stats = torch.nn.Parameter(torch.cat(scales_3d_list))
+        self.model.grouping_field.quantile_transformer = self._get_quantile_func(
+            torch.cat(scales_3d_list)
+        )
 
         # Turn model back to train mode
         self.model.train()
-
 
     def load_state_dict(self, state_dict: Mapping[str, Any], strict: bool = True):
         """

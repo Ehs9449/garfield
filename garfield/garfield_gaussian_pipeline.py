@@ -1,3 +1,20 @@
+# Add this at the very top of garfield_gaussian_pipeline.py
+# BEFORE any other imports
+
+import torch
+
+# Monkey patch torch.load to always use weights_only=False for backward compatibility
+_original_torch_load = torch.load
+
+def _patched_torch_load(f, map_location=None, pickle_module=None, weights_only=None, **kwargs):
+    """Patched torch.load that defaults to weights_only=False for compatibility"""
+    if weights_only is None:
+        weights_only = False
+    return _original_torch_load(f, map_location=map_location, pickle_module=pickle_module, 
+                               weights_only=weights_only, **kwargs)
+
+torch.load = _patched_torch_load
+import numpy as np
 import typing
 from dataclasses import dataclass, field
 from typing import Literal, Type, Mapping, Any, Optional, List, Dict
@@ -9,7 +26,7 @@ import viser.transforms as vtf
 import open3d as o3d
 import cv2
 import time
-
+import json
 import torch
 from nerfstudio.pipelines.base_pipeline import VanillaPipeline, VanillaPipelineConfig
 from torch.cuda.amp.grad_scaler import GradScaler
@@ -66,7 +83,11 @@ class GarfieldGaussianPipelineConfig(VanillaPipelineConfig):
     """Gaussian Splatting, but also loading GARField grouping field from ckpt."""
     _target: Type = field(default_factory=lambda: GarfieldGaussianPipeline)
     garfield_ckpt: Optional[Path] = None  # Need to specify this
-
+    # LEGO conversion parameters
+    lego_voxel_size: float = 0.002  # Size of each voxel in meters (LEGO unit size)
+    lego_min_brick_size: int = 1  # Minimum brick size (1x1)
+    lego_max_brick_size: int = 4  # Maximum brick size (4x4)
+    lego_enable_merging: bool = True  # Whether to merge voxels into larger bricks
 
 class GarfieldGaussianPipeline(VanillaPipeline):
     """
@@ -103,7 +124,19 @@ class GarfieldGaussianPipeline(VanillaPipeline):
         _, garfield_pipeline, _, _ = eval_setup(
             config.garfield_ckpt, test_mode="inference"
         )
+        # Choose device for grouping model:
+        # tinycudann requires model params to be on CUDA for forward to work.
+        grouping_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        try:
+            garfield_pipeline.model.eval()
+            garfield_pipeline.model.to(grouping_device)
+        except Exception:
+            # some models may not support `.to` fully; ignore and still keep reference
+            pass
         self.garfield_pipeline = [garfield_pipeline]
+        # store device so other methods know where to put inputs for grouping
+        self._grouping_device = grouping_device
+
         self.state_stack = []
 
         self.colormap = generate_random_colors()
@@ -132,7 +165,47 @@ class GarfieldGaussianPipeline(VanillaPipeline):
         self.cluster_scene_scale = ViewerSlider(name="Cluster Scale", min_value=0.0, max_value=2.0, step=0.01, default_value=0.0, disabled=False, visible=False)
         self.cluster_scene_shuffle_colors = ViewerButton(name="Reshuffle Cluster Colors", cb_hook=self._reshuffle_cluster_colors, disabled=False, visible=False)
         self.cluster_labels = None
-
+        # Cluster selection and multi-view rendering
+        self.select_cluster_by_click = ViewerButton(
+            name="Select Cluster by Click", 
+            cb_hook=self._select_cluster_by_click, 
+            disabled=True, 
+            visible=False
+        )
+        self.isolate_selected_cluster = ViewerButton(
+            name="Isolate Selected Cluster",
+            cb_hook=self._isolate_selected_cluster,
+            disabled=True,
+            visible=False
+        )
+        self.render_isolated_cluster_views = ViewerButton(
+            name="Generate Camera Path for Cluster",
+            cb_hook=self._generate_camera_path_for_cluster,  # NEW
+            disabled=True,
+            visible=False
+        )
+        self.num_render_views = ViewerSlider(
+            name="Number of Views",
+            min_value=4,
+            max_value=12,
+            step=1,
+            default_value=6,
+            visible=False
+        )
+        self.convert_cluster_to_mesh = ViewerButton(
+            name="Convert Cluster to Mesh",
+            cb_hook=self._convert_cluster_to_mesh,
+            disabled=True,
+            visible=False
+        )
+        self.convert_cluster_to_lego = ViewerButton(
+            name="Convert Cluster to LEGO Mesh",
+            cb_hook=self._convert_cluster_to_lego,
+            disabled=True,
+            visible=False
+        )
+        self.selected_cluster_id = None
+        self.isolated_cluster_indices = None
         self.reset_state = ViewerButton(name="Reset State", cb_hook=self._reset_state, disabled=True)
 
         self.z_export_options = ViewerCheckbox(name="Export Options", default_value=False, cb_hook=self._update_export_options)
@@ -143,6 +216,7 @@ class GarfieldGaussianPipeline(VanillaPipeline):
             )
         self.z_export_options_camera_path_filename = ViewerText("Camera Path Filename", "", visible=False)
         self.z_export_options_camera_path_render = ViewerButton("Render Current Pipeline", cb_hook=self.render_from_path, visible=False)
+        self.z_export_semantic_pointcloud = ViewerButton("Export Semantic Pointcloud", visible=False, cb_hook=self._export_semantic_pointcloud)
 
     def _update_interaction_method(self, dropdown: ViewerDropdown):
         """Update the UI based on the interaction method"""
@@ -162,39 +236,60 @@ class GarfieldGaussianPipeline(VanillaPipeline):
         self.z_export_options_camera_path_filename.set_hidden(not checkbox.value)
         self.z_export_options_camera_path_render.set_hidden(not checkbox.value)
         self.z_export_options_visible_gaussians.set_hidden(not checkbox.value)
+        self.z_export_semantic_pointcloud.set_hidden(not checkbox.value)
 
     def _reset_state(self, button: ViewerButton):
         """Revert to previous saved state"""
         assert len(self.state_stack) > 0, "No previous state to revert to"
-        prev_state = self.state_stack.pop()
-        for name in self.model.gauss_params.keys():
-            self.model.gauss_params[name] = prev_state[name]
+        state_entry = self.state_stack.pop()
+        # state_entry is now a filename (str) created by _queue_state
+        if isinstance(state_entry, (str, Path)):
+            data = np.load(state_entry, allow_pickle=False)
+            for name in self.model.gauss_params.keys():
+                # load numpy, convert to tensor and register as parameter
+                arr = data[name]
+                tensor = torch.nn.Parameter(torch.from_numpy(arr).to(self.device))
+                self.model.gauss_params[name] = tensor
+            # optionally delete the file to free disk if you want
+            try:
+                os.remove(state_entry)
+            except Exception:
+                pass
+        else:
+            # backward compat: older code path where state stored in memory dict
+            prev_state = state_entry
+            for name in self.model.gauss_params.keys():
+                self.model.gauss_params[name] = prev_state[name]
 
-        self.click_location = None
-        if self.click_handle is not None:
-            self.click_handle.remove()
-        self.click_handle = None
-
-        self.click_gaussian.set_disabled(False)
-
-        self.crop_to_click.set_disabled(True)
-        self.crop_to_group_level.set_disabled(True)
-        # self.crop_to_group_level.value = 0
-        self.move_current_crop.set_disabled(True)
-        self.crop_group_list = []
-        if self.crop_transform_handle is not None:
-            self.crop_transform_handle.remove()
-            self.crop_transform_handle = None
         if len(self.state_stack) == 0:
             self.reset_state.set_disabled(True)
+
 
         self.cluster_labels = None
         self.cluster_scene.set_disabled(False)
 
     def _queue_state(self):
-        """Save current state to stack"""
-        import copy
-        self.state_stack.append(copy.deepcopy({k:v.detach() for k,v in self.model.gauss_params.items()}))
+        """Save current state to disk-backed stack to avoid huge RAM usage."""
+        import tempfile
+        output_dir = Path(f"outputs/{self.datamanager.config.dataparser.data.name}/gauss_state")
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create a filename based on stack length (or timestamp)
+        idx = len(self.state_stack)
+        fname = output_dir / f"state_{idx:04d}.npz"
+
+        # Save only CPU numpy arrays (no gradients)
+        to_save = {}
+        for k, v in self.model.gauss_params.items():
+            # detach -> cpu -> numpy
+            arr = v.detach().cpu().numpy()
+            to_save[k] = arr
+
+        # write compressed file
+        np.savez_compressed(str(fname), **to_save)
+
+        # push the filename so we don't hold the tensors in RAM
+        self.state_stack.append(str(fname))
         self.reset_state.set_disabled(False)
 
     def _click_gaussian(self, button: ViewerButton):
@@ -277,8 +372,13 @@ class GarfieldGaussianPipeline(VanillaPipeline):
         # Iterate over different scales, to get the a range of possible groupings.
         grouping_model = self.garfield_pipeline[0].model
         for s in tqdm.tqdm(torch.linspace(0, 1.5, 30)):
-            # Calculate the grouping features, and calculate the affinity between click point and scene
-            instances = grouping_model.get_grouping_at_points(positions, s)  # (1+N, 256)
+            # Move positions to grouping device in small batch (positions could be on self.device)
+            _positions = positions.to(self._grouping_device)
+            with torch.no_grad():
+                instances = grouping_model.get_grouping_at_points(_positions, s)
+            # ensure CPU tensor for numpy/o3d ops below
+            if isinstance(instances, torch.Tensor):
+                instances = instances.cpu()
             click_instance = instances[0]
             affinity = torch.norm(click_instance - instances, dim=1)[1:]
 
@@ -457,9 +557,26 @@ class GarfieldGaussianPipeline(VanillaPipeline):
         scale = self.cluster_scene_scale.value
         grouping_model = self.garfield_pipeline[0].model
         
-        positions = self.model.gauss_params['means'].detach()
-        group_feats = grouping_model.get_grouping_at_points(positions, scale).cpu().numpy()  # (N, 256)
-        positions = positions.cpu().numpy()
+        positions_t = self.model.gauss_params['means'].detach()  # tensor on model device (likely GPU)
+        # move positions to CPU for grouping model (which we kept on CPU earlier)
+        positions_cpu = positions_t.cpu()
+        N = positions_cpu.shape[0]
+        batch_size = 8192  # tune down if still high memory; smaller = less peak RAM
+        feats_list = []
+        for s_i in range(0, N, batch_size):
+            p_batch = positions_cpu[s_i : s_i + batch_size]  # CPU tensor
+            # move the batch to the grouping device (GPU if available)
+            _p_in = p_batch.to(self._grouping_device)
+            with torch.no_grad():
+                f_batch = grouping_model.get_grouping_at_points(_p_in, scale)
+            # move outputs back to CPU / numpy
+            if isinstance(f_batch, torch.Tensor):
+                f_batch = f_batch.cpu().numpy()
+            feats_list.append(f_batch)
+
+        group_feats = np.concatenate(feats_list, axis=0)
+        positions = positions_cpu.numpy()
+
 
         start = time.time()
 
@@ -553,7 +670,10 @@ class GarfieldGaussianPipeline(VanillaPipeline):
 
         self.model.gauss_params['features_dc'] = torch.nn.Parameter(self.model.gauss_params['features_dc'])
         self.model.gauss_params['features_rest'] = torch.nn.Parameter(self.model.gauss_params['features_rest'])
-
+        # Enable cluster selection after clustering completes
+        self.select_cluster_by_click.set_disabled(False)
+        self.select_cluster_by_click.set_hidden(False)
+        self.num_render_views.set_hidden(False)
         self.cluster_scene.set_disabled(False)
         self.viewer_control.viewer._trigger_rerender()  # trigger viewer rerender
 
@@ -646,3 +766,784 @@ class GarfieldGaussianPipeline(VanillaPipeline):
                 output_format="video",
             )
         self.model.train()
+
+    def _export_semantic_pointcloud(self, button: ViewerButton):
+        """Export semantic point cloud with building element labels"""
+        print("Starting semantic point cloud export...")
+    
+        output_folder = "semantic_export"
+        Path(output_folder).mkdir(exist_ok=True)
+    
+        # Get Gaussian data
+        with torch.no_grad():
+            positions = self.model.means.detach().cpu().numpy()
+        
+        # Get colors
+        if hasattr(self.model, 'shs_0'):
+            colors = self.model.shs_0.detach().cpu().numpy().squeeze() + 0.5
+            colors = np.clip(colors, 0, 1)
+        else:
+            colors = np.ones((len(positions), 3)) * 0.5
+    
+        # Get semantic labels
+        semantic_labels = self._get_semantic_labels(len(positions))
+        semantic_colors = self._create_semantic_colors(semantic_labels)
+    
+        # Save point clouds
+        self._save_semantic_pointclouds(positions, colors, semantic_colors, semantic_labels, output_folder)
+    
+        print(f"Export completed! Check folder: {output_folder}")
+
+    def _get_semantic_labels(self, num_points):
+        """Get semantic labels for each Gaussian"""
+    
+        # Use cluster labels if available
+        if self.cluster_labels is not None:
+            cluster_labels = self.cluster_labels.detach().cpu().numpy()
+            if len(cluster_labels) == num_points:
+                # Map clusters to building elements
+                semantic_labels = cluster_labels % 9  # Map to 9 categories
+                print(f"Using cluster labels: {len(np.unique(semantic_labels))} semantic classes")
+                return semantic_labels
+    
+        # Fallback: position-based labeling
+        print("Using position-based semantic labeling")
+        positions = self.model.means.detach().cpu().numpy()
+        heights = positions[:, 2]
+    
+        # Normalize heights
+        min_h, max_h = heights.min(), heights.max()
+        norm_heights = (heights - min_h) / (max_h - min_h + 1e-8)
+    
+        # Simple semantic assignment
+        labels = np.zeros(len(positions), dtype=int)
+        labels[norm_heights <= 0.2] = 2  # doors
+        labels[(norm_heights > 0.2) & (norm_heights <= 0.6)] = 4  # walls
+        labels[(norm_heights > 0.6) & (norm_heights <= 0.8)] = 1  # windows
+        labels[norm_heights > 0.8] = 5  # roof
+    
+        return labels
+
+    def _create_semantic_colors(self, semantic_labels):
+        """Create colors for semantic visualization"""
+        color_map = {
+            0: [0.5, 0.5, 0.5],  # background - gray
+            1: [0.0, 0.8, 1.0],  # window - light blue
+            2: [0.8, 0.4, 0.0],  # door - brown
+            3: [0.9, 0.9, 0.9],  # column - white
+            4: [0.7, 0.7, 0.6],  # wall - light gray
+            5: [0.8, 0.2, 0.2],  # roof - red
+            6: [0.2, 0.8, 0.2],  # balcony - green
+            7: [1.0, 1.0, 0.0],  # stair - yellow
+            8: [0.6, 0.4, 0.2],  # facade - beige
+        }
+    
+        return np.array([color_map.get(label, [0.5, 0.5, 0.5]) for label in semantic_labels])
+
+    def _save_semantic_pointclouds(self, positions, colors, semantic_colors, semantic_labels, output_folder):
+        """Save point clouds in different formats"""
+        output_path = Path(output_folder)
+    
+        # RGB point cloud
+        pcd_rgb = o3d.geometry.PointCloud()
+        pcd_rgb.points = o3d.utility.Vector3dVector(positions)
+        pcd_rgb.colors = o3d.utility.Vector3dVector(colors)
+        o3d.io.write_point_cloud(str(output_path / "building_rgb.ply"), pcd_rgb)
+    
+        # Semantic point cloud
+        pcd_semantic = o3d.geometry.PointCloud()
+        pcd_semantic.points = o3d.utility.Vector3dVector(positions)
+        pcd_semantic.colors = o3d.utility.Vector3dVector(semantic_colors)
+        o3d.io.write_point_cloud(str(output_path / "building_semantic.ply"), pcd_semantic)
+    
+        # Individual elements
+        element_names = {0: 'background', 1: 'windows', 2: 'doors', 3: 'columns', 
+                        4: 'walls', 5: 'roof', 6: 'balconies', 7: 'stairs', 8: 'facade'}
+    
+        elements_dir = output_path / "building_elements"
+        elements_dir.mkdir(exist_ok=True)
+    
+        for label_id, element_name in element_names.items():
+            mask = semantic_labels == label_id
+            if not mask.any():
+                continue
+            
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(positions[mask])
+            pcd.colors = o3d.utility.Vector3dVector(colors[mask])
+            o3d.io.write_point_cloud(str(elements_dir / f"{element_name}.ply"), pcd)
+            print(f"Saved {element_name}: {mask.sum()} points")
+
+    def _select_cluster_by_click(self, button: ViewerButton):
+        """Start listening for click to select a specific cluster"""
+        if self.cluster_labels is None:
+            print("No clusters available. Run clustering first.")
+            return
+    
+        def on_cluster_click(click: ViewerClick):
+            self._identify_and_select_cluster(click)
+            self.select_cluster_by_click.set_disabled(False)
+            self.viewer_control.unregister_click_cb(on_cluster_click)
+    
+        self.select_cluster_by_click.set_disabled(True)
+        print("Click on a cluster to select it...")
+        self.viewer_control.register_click_cb(on_cluster_click)
+
+    def _identify_and_select_cluster(self, click: ViewerClick):
+        """Identify which cluster was clicked"""
+        # Get 3D click position using ray casting
+        cam = self.viewer_control.get_camera(500, None, 0)
+        cam2world = cam.camera_to_worlds[0, :3, :3]
+        import viser.transforms as vtf
+    
+        x_pi = vtf.SO3.from_x_radians(np.pi).as_matrix().astype(np.float32)
+        world2cam = (cam2world @ x_pi).inverse()
+        newdir = world2cam @ torch.tensor(click.direction).unsqueeze(-1)
+        z_dir = newdir[2].item()
+    
+        K = cam.get_intrinsics_matrices()[0]
+        coords = K @ newdir
+        coords = coords / coords[2]
+        pix_x, pix_y = int(coords[0]), int(coords[1])
+    
+        self.model.eval()
+        outputs = self.model.get_outputs(cam.to(self.device))
+        self.model.train()
+    
+        with torch.no_grad():
+            depth = outputs["depth"][pix_y, pix_x].cpu().numpy()
+    
+        click_location = np.array(click.origin) + np.array(click.direction) * (depth / z_dir)
+    
+        # Find nearest Gaussian to click location
+        curr_means = self.model.gauss_params['means'].detach().cpu().numpy()
+        distances = np.linalg.norm(curr_means - click_location, axis=1)
+        nearest_idx = np.argmin(distances)
+    
+        # Get cluster ID at that Gaussian
+        cluster_id = int(self.cluster_labels[nearest_idx].item())
+    
+        if cluster_id < 0:
+            print("Clicked on unclustered/noise point. Please click on a colored cluster.")
+            return
+    
+        self.selected_cluster_id = cluster_id
+    
+        # Count points in this cluster
+        cluster_mask = (self.cluster_labels == cluster_id).cpu().numpy()
+        num_points = cluster_mask.sum()
+    
+        print(f"Selected Cluster ID: {cluster_id} with {num_points} points")
+    
+        # Enable isolation button
+        self.isolate_selected_cluster.set_disabled(False)
+        self.isolate_selected_cluster.set_hidden(False)
+
+    def _isolate_selected_cluster(self, button: ViewerButton):
+        """Isolate the selected cluster - hide all other clusters"""
+        if self.selected_cluster_id is None:
+            print("No cluster selected. Use 'Select Cluster by Click' first.")
+            return
+
+        self._queue_state()  # Save current state before isolation
+
+        # Get indices of selected cluster
+        cluster_mask = (self.cluster_labels == self.selected_cluster_id).cpu().numpy()
+        self.isolated_cluster_indices = np.where(cluster_mask)[0]
+
+        # RESTORE ORIGINAL RGB COLORS for the selected cluster
+        # Load from the saved state (before clustering changed colors)
+        if len(self.state_stack) > 0:
+            original_state = np.load(self.state_stack[0], allow_pickle=False)
+            original_features_dc = torch.from_numpy(original_state['features_dc']).to(self.device)
+            original_features_rest = torch.from_numpy(original_state['features_rest']).to(self.device)
+        
+            # CORRECT - create new tensors
+            features_dc = self.model.gauss_params['features_dc'].detach().clone()
+            features_rest = self.model.gauss_params['features_rest'].detach().clone()
+
+            features_dc[cluster_mask] = original_features_dc[cluster_mask]
+            features_rest[cluster_mask] = original_features_rest[cluster_mask]
+
+            self.model.gauss_params['features_dc'] = torch.nn.Parameter(features_dc)
+            self.model.gauss_params['features_rest'] = torch.nn.Parameter(features_rest)
+
+        # Hide all non-selected clusters by setting their opacity to -100
+        opacities = self.model.gauss_params['opacities'].detach().clone()
+        opacities[~cluster_mask] = -100
+        self.model.gauss_params['opacities'] = torch.nn.Parameter(opacities.float())
+
+        print(f"Isolated cluster {self.selected_cluster_id} ({len(self.isolated_cluster_indices)} points)")
+        print("Restored original RGB colors for rendering")
+
+        # Enable render button
+        self.render_isolated_cluster_views.set_disabled(False)
+        self.render_isolated_cluster_views.set_hidden(False)
+        self.isolate_selected_cluster.set_disabled(True)
+        self.convert_cluster_to_lego.set_disabled(False)
+        self.convert_cluster_to_lego.set_visible(True)
+
+        self.viewer_control.viewer._trigger_rerender()
+
+    def _generate_camera_path_for_cluster(self, button: ViewerButton):
+        """Generate camera path and render views for isolated cluster"""
+        if self.isolated_cluster_indices is None or self.selected_cluster_id is None:
+            print("No isolated cluster.")
+            return
+
+        # Get cluster info
+        cluster_positions = self.model.gauss_params['means'].detach().cpu().numpy()[self.isolated_cluster_indices]
+        centroid = cluster_positions.mean(axis=0)
+        bbox_size = np.linalg.norm(cluster_positions.max(axis=0) - cluster_positions.min(axis=0))
+
+        num_views = int(self.num_render_views.value)
+        radius = bbox_size * 1.8
+
+        print(f"Generating and rendering {num_views} views for cluster {self.selected_cluster_id}")
+        print(f"Centroid: {centroid}, Radius: {radius}, BBox: {bbox_size}")
+
+        # Create camera path
+        from nerfstudio.cameras.cameras import Cameras
+
+        # Generate camera positions
+        camera_to_worlds = []
+        for i in range(num_views):
+            angle = 2 * np.pi * i / num_views
+            x = centroid[0] + radius * np.cos(angle)
+            y = centroid[1] + radius * np.sin(angle)
+            z = centroid[2] + radius * 0.3  # Add elevation
+
+            # Look at centroid
+            position = np.array([x, y, z], dtype=np.float32)
+            forward = centroid - position
+            forward = forward / np.linalg.norm(forward)
+
+            world_up = np.array([0, 0, 1], dtype=np.float32)
+            right = np.cross(world_up, forward)
+            right_norm = np.linalg.norm(right)
+        
+            if right_norm < 1e-6:
+                right = np.array([1, 0, 0], dtype=np.float32)
+            else:
+                right = right / right_norm
+        
+            up = np.cross(forward, right)
+            up = up / np.linalg.norm(up)
+
+            # Build transform (with -forward for proper camera orientation)
+            c2w = np.eye(4, dtype=np.float32)
+            c2w[:3, 0] = right
+            c2w[:3, 1] = up
+            c2w[:3, 2] = -forward  # Negative for camera convention
+            c2w[:3, 3] = position
+
+            camera_to_worlds.append(torch.from_numpy(c2w[:3, :4]))
+
+        # Create camera path object
+        camera_path = Cameras(
+            camera_to_worlds=torch.stack(camera_to_worlds),
+            fx=self.datamanager.train_dataset.cameras.fx[0].repeat(num_views),
+            fy=self.datamanager.train_dataset.cameras.fy[0].repeat(num_views),
+            cx=self.datamanager.train_dataset.cameras.cx[0].repeat(num_views),
+            cy=self.datamanager.train_dataset.cameras.cy[0].repeat(num_views),
+            width=self.datamanager.train_dataset.cameras.width[0].repeat(num_views),
+            height=self.datamanager.train_dataset.cameras.height[0].repeat(num_views),
+        )
+
+        # Output directory
+        output_dir = Path(f"outputs/{self.datamanager.config.dataparser.data.name}/cluster_{self.selected_cluster_id}_views")
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Render each view
+        self.model.eval()
+        print("Rendering views...")
+        with torch.no_grad():
+            for i in range(num_views):
+                # Get single camera
+                camera = camera_path[i:i+1].to(self.device)
+
+                # Render
+                outputs = self.model.get_outputs_for_camera(camera)
+
+                # Save RGB
+                rgb = outputs["rgb"].cpu().numpy()
+                rgb = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
+                cv2.imwrite(str(output_dir / f"view_{i:03d}.png"), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+
+                print(f"  Rendered view {i+1}/{num_views}")
+
+        self.model.train()
+
+        # Save metadata
+        metadata = {
+            "cluster_id": int(self.selected_cluster_id),
+            "num_views": num_views,
+            "centroid": centroid.tolist(),
+            "radius": float(radius),
+            "bbox_size": float(bbox_size)
+        }
+        with open(output_dir / "metadata.json", 'w') as f:
+            json.dump(metadata, f, indent=2)
+
+        print(f"\n✓ Rendered {num_views} views to: {output_dir}")
+        print(f"✓ Ready for diffusion completion")
+    def _export_isolated_cluster_gaussians(self, button: ViewerButton):
+        """Export only the isolated cluster gaussians to PLY file"""
+        if self.isolated_cluster_indices is None or self.selected_cluster_id is None:
+            print("No isolated cluster to export.")
+            return None
+    
+        from collections import OrderedDict
+    
+        # Output directory
+        output_dir = Path(f"outputs/{self.datamanager.config.dataparser.data.name}/cluster_{self.selected_cluster_id}_export")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        filename = output_dir / f"cluster_{self.selected_cluster_id}.ply"
+    
+        map_to_tensors = OrderedDict()
+    
+        with torch.no_grad():
+            # Get only the isolated cluster indices
+            positions = self.model.means[self.isolated_cluster_indices].cpu().numpy()
+            count = positions.shape[0]
+        
+            map_to_tensors["x"] = positions[:, 0]
+            map_to_tensors["y"] = positions[:, 1]
+            map_to_tensors["z"] = positions[:, 2]
+            map_to_tensors["nx"] = np.zeros(count, dtype=np.float32)
+            map_to_tensors["ny"] = np.zeros(count, dtype=np.float32)
+            map_to_tensors["nz"] = np.zeros(count, dtype=np.float32)
+        
+            if self.model.config.sh_degree > 0:
+                shs_0 = self.model.shs_0[self.isolated_cluster_indices].contiguous().cpu().numpy()
+                for i in range(shs_0.shape[1]):
+                    map_to_tensors[f"f_dc_{i}"] = shs_0[:, i, None]
+            
+                shs_rest = self.model.shs_rest[self.isolated_cluster_indices].transpose(1, 2).contiguous().cpu().numpy()
+                shs_rest = shs_rest.reshape((count, -1))
+                for i in range(shs_rest.shape[-1]):
+                    map_to_tensors[f"f_rest_{i}"] = shs_rest[:, i, None]
+            else:
+                colors = torch.clamp(self.model.colors[self.isolated_cluster_indices].clone(), 0.0, 1.0).cpu().numpy()
+                map_to_tensors["colors"] = (colors * 255).astype(np.uint8)
+        
+                map_to_tensors["opacity"] = self.model.opacities[self.isolated_cluster_indices].cpu().numpy()
+        
+            scales = self.model.scales[self.isolated_cluster_indices].cpu().numpy()
+            for i in range(3):
+                map_to_tensors[f"scale_{i}"] = scales[:, i, None]
+        
+            quats = self.model.quats[self.isolated_cluster_indices].cpu().numpy()
+            for i in range(4):
+                map_to_tensors[f"rot_{i}"] = quats[:, i, None]
+    
+        # Check for NaN/Inf
+        select = np.ones(count, dtype=bool)
+        for k, t in map_to_tensors.items():
+            select = np.logical_and(select, np.isfinite(t).all(axis=-1))
+    
+        if np.sum(select) < count:
+            print(f"Removed {count - np.sum(select)} NaN/Inf gaussians")
+            for k in map_to_tensors.keys():
+                map_to_tensors[k] = map_to_tensors[k][select]
+            count = np.sum(select)
+    
+        # Write PLY
+        from nerfstudio.scripts.exporter import ExportGaussianSplat
+        ExportGaussianSplat.write_ply(str(filename), count, map_to_tensors)
+    
+        print(f"✓ Exported {count} gaussians to: {filename}")
+        return filename
+
+    def _convert_cluster_to_mesh(self, button: ViewerButton):
+        """Convert isolated cluster gaussians to mesh using Poisson reconstruction"""
+        if self.isolated_cluster_indices is None or self.selected_cluster_id is None:
+            print("No isolated cluster to convert.")
+            return
+    
+        # First export gaussians
+        print("Exporting cluster gaussians...")
+        ply_file = self._export_isolated_cluster_gaussians(button)
+    
+        if ply_file is None:
+            return
+    
+        print("Converting to mesh using Poisson reconstruction...")
+    
+        # Load gaussian positions as point cloud
+        positions = self.model.means[self.isolated_cluster_indices].detach().cpu().numpy()
+        colors = None
+    
+        if hasattr(self.model, 'shs_0'):
+            # Convert SH to RGB (simplified - just use DC component)
+            colors = self.model.shs_0[self.isolated_cluster_indices].detach().cpu().numpy().squeeze() + 0.5
+            colors = np.clip(colors, 0, 1)
+    
+        # Create Open3D point cloud
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(positions)
+        if colors is not None:
+            pcd.colors = o3d.utility.Vector3dVector(colors)
+    
+        # Estimate normals
+        print("Estimating normals...")
+        pcd.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)
+        )
+        pcd.orient_normals_consistent_tangent_plane(k=15)
+    
+        # Poisson reconstruction
+        print("Running Poisson surface reconstruction...")
+        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+            pcd, depth=9, width=0, scale=1.1, linear_fit=False
+        )
+    
+        # Remove low density vertices (outliers)
+        densities = np.asarray(densities)
+        density_threshold = np.quantile(densities, 0.01)
+        vertices_to_remove = densities < density_threshold
+        mesh.remove_vertices_by_mask(vertices_to_remove)
+    
+        # Save mesh
+        output_dir = Path(f"outputs/{self.datamanager.config.dataparser.data.name}/cluster_{self.selected_cluster_id}_export")
+        mesh_file = output_dir / f"cluster_{self.selected_cluster_id}_mesh.ply"
+        o3d.io.write_triangle_mesh(str(mesh_file), mesh)
+    
+        print(f"✓ Mesh saved to: {mesh_file}")
+        print(f"  Vertices: {len(mesh.vertices)}, Faces: {len(mesh.triangles)}")
+    
+        # Also save as OBJ for easier viewing
+        obj_file = output_dir / f"cluster_{self.selected_cluster_id}_mesh.obj"
+        o3d.io.write_triangle_mesh(str(obj_file), mesh)
+        print(f"✓ Also saved as OBJ: {obj_file}")
+    def _voxelize_cluster_gaussians(self, voxel_size=0.08):
+        """
+        Convert isolated cluster gaussians to voxel grid.
+    
+        Args:
+            voxel_size: Size of each voxel cube in world units
+        
+        Returns:
+            voxel_grid: 3D numpy array of occupied voxels (1=occupied, 0=empty)
+            origin: The world-space origin of the voxel grid
+            grid_shape: Shape of the voxel grid (x, y, z)
+        """
+        if self.isolated_cluster_indices is None:
+            print("No isolated cluster available for voxelization")
+            return None, None, None
+    
+        print(f"Voxelizing cluster with voxel size: {voxel_size}")
+    
+        # Get gaussian positions for isolated cluster
+        positions = self.model.means[self.isolated_cluster_indices].detach().cpu().numpy()
+    
+        # Get colors if available
+        colors = None
+        if hasattr(self.model, 'shs_0'):
+            colors = self.model.shs_0[self.isolated_cluster_indices].detach().cpu().numpy().squeeze() + 0.5
+            colors = np.clip(colors, 0, 1)
+    
+        # Calculate bounding box
+        min_bound = positions.min(axis=0)
+        max_bound = positions.max(axis=0)
+    
+        # Add padding
+        padding = voxel_size * 2
+        min_bound -= padding
+        max_bound += padding
+    
+        # Calculate grid dimensions
+        grid_size = np.ceil((max_bound - min_bound) / voxel_size).astype(int)
+    
+        print(f"  Grid size: {grid_size} voxels")
+        print(f"  World bounds: {min_bound} to {max_bound}")
+    
+        # Initialize voxel grid and color grid
+        voxel_grid = np.zeros(grid_size, dtype=bool)
+        color_grid = np.zeros((*grid_size, 3), dtype=np.float32)
+        color_count = np.zeros(grid_size, dtype=int)
+    
+        # Fill voxel grid
+        for i, pos in enumerate(positions):
+            voxel_idx = ((pos - min_bound) / voxel_size).astype(int)
+        
+            # Clamp to grid bounds
+            voxel_idx = np.clip(voxel_idx, 0, grid_size - 1)
+        
+            voxel_grid[tuple(voxel_idx)] = True
+        
+            if colors is not None:
+                color_grid[tuple(voxel_idx)] += colors[i]
+                color_count[tuple(voxel_idx)] += 1
+    
+        # Average colors for voxels with multiple gaussians
+        mask = color_count > 0
+        color_grid[mask] /= color_count[mask][..., None]
+    
+        occupied_voxels = np.sum(voxel_grid)
+        print(f"  Occupied voxels: {occupied_voxels}")
+    
+        return voxel_grid, color_grid, min_bound, grid_size
+    def _place_lego_bricks(self, voxel_grid, color_grid, min_brick_size=1, max_brick_size=4, enable_merging=True):
+        """
+        Place LEGO bricks using greedy algorithm to fill occupied voxels.
+    
+        Args:
+            voxel_grid: 3D boolean array of occupied voxels
+            color_grid: 3D color array (x, y, z, 3)
+            min_brick_size: Minimum brick dimension
+            max_brick_size: Maximum brick dimension
+            enable_merging: Whether to merge voxels into larger bricks
+        
+        Returns:
+            bricks: List of dicts with keys: 'position', 'size', 'color'
+        """
+        print("Placing LEGO bricks...")
+    
+        # Copy voxel grid so we can mark placed voxels
+        remaining_voxels = voxel_grid.copy()
+        bricks = []
+    
+        if not enable_merging:
+            # Simple 1x1x1 bricks for each occupied voxel
+            occupied_positions = np.argwhere(voxel_grid)
+            for pos in occupied_positions:
+                bricks.append({
+                    'position': pos,
+                    'size': np.array([1, 1, 1]),
+                    'color': color_grid[tuple(pos)]
+                })
+            print(f"  Placed {len(bricks)} 1x1x1 bricks (no merging)")
+            return bricks
+    
+        # Greedy brick placement - start with largest bricks
+        # Define brick sizes to try (prioritize common LEGO brick sizes)
+        brick_sizes = [
+            # Large bricks first
+            [4, 2, 1], [4, 1, 1], [2, 4, 1],
+            [3, 2, 1], [3, 1, 1], [2, 3, 1],
+            [2, 2, 1], [2, 1, 1],
+            [1, 1, 1]  # Single studs last
+        ]
+    
+        # Filter by max_brick_size
+        brick_sizes = [s for s in brick_sizes if all(d <= max_brick_size for d in s)]
+    
+        total_voxels = np.sum(voxel_grid)
+        placed_voxels = 0
+    
+        # Try to place bricks
+        for brick_size in brick_sizes:
+            brick_size = np.array(brick_size)
+        
+            # Scan through grid
+            for x in range(voxel_grid.shape[0] - brick_size[0] + 1):
+                for y in range(voxel_grid.shape[1] - brick_size[1] + 1):
+                    for z in range(voxel_grid.shape[2] - brick_size[2] + 1):
+                        # Check if brick fits
+                        region = remaining_voxels[
+                            x:x+brick_size[0],
+                            y:y+brick_size[1],
+                            z:z+brick_size[2]
+                        ]
+                    
+                        if region.shape != tuple(brick_size):
+                            continue
+                    
+                        # Check if all voxels in region are occupied
+                        if np.all(region):
+                            # Place brick
+                            position = np.array([x, y, z])
+                        
+                            # Get average color for this brick
+                            color_region = color_grid[
+                                x:x+brick_size[0],
+                                y:y+brick_size[1],
+                                z:z+brick_size[2]
+                            ]
+                            avg_color = np.mean(color_region.reshape(-1, 3), axis=0)
+                        
+                            bricks.append({
+                                'position': position,
+                                'size': brick_size.copy(),
+                                'color': avg_color
+                            })
+                        
+                            # Mark voxels as placed
+                            remaining_voxels[
+                                x:x+brick_size[0],
+                                y:y+brick_size[1],
+                                z:z+brick_size[2]
+                            ] = False
+                        
+                            placed_voxels += np.prod(brick_size)
+    
+        print(f"  Placed {len(bricks)} bricks")
+        print(f"  Coverage: {placed_voxels}/{total_voxels} voxels ({100*placed_voxels/total_voxels:.1f}%)")
+    
+        return bricks
+    def _generate_lego_mesh(self, bricks, voxel_size, origin):
+        """
+        Generate Open3D mesh from LEGO bricks.
+    
+        Args:
+            bricks: List of brick dictionaries from _place_lego_bricks
+            voxel_size: Size of each voxel in world units
+            origin: World-space origin of the voxel grid
+        
+        Returns:
+            mesh: Combined Open3D TriangleMesh
+        """
+        print("Generating LEGO mesh...")
+    
+        all_vertices = []
+        all_triangles = []
+        all_colors = []
+        vertex_offset = 0
+    
+        for i, brick in enumerate(bricks):
+            pos = brick['position']
+            size = brick['size']
+            color = brick['color']
+        
+            # Calculate world-space position and dimensions
+            world_pos = origin + pos * voxel_size
+            world_size = size * voxel_size
+        
+            # Create box mesh for this brick
+            brick_mesh = o3d.geometry.TriangleMesh.create_box(
+                width=world_size[0],
+                height=world_size[1],
+                depth=world_size[2]
+            )
+        
+            # Translate to correct position
+            brick_mesh.translate(world_pos)
+        
+            # Set color
+            brick_mesh.paint_uniform_color(color)
+        
+            # Get vertices, triangles, and colors
+            vertices = np.asarray(brick_mesh.vertices)
+            triangles = np.asarray(brick_mesh.triangles)
+            colors = np.asarray(brick_mesh.vertex_colors)
+        
+            # Add to combined mesh
+            all_vertices.append(vertices)
+            all_triangles.append(triangles + vertex_offset)
+            all_colors.append(colors)
+        
+            vertex_offset += len(vertices)
+        
+            if (i + 1) % 100 == 0:
+                print(f"  Generated {i + 1}/{len(bricks)} bricks...")
+    
+        # Combine all meshes
+        combined_mesh = o3d.geometry.TriangleMesh()
+        combined_mesh.vertices = o3d.utility.Vector3dVector(np.vstack(all_vertices))
+        combined_mesh.triangles = o3d.utility.Vector3iVector(np.vstack(all_triangles))
+        combined_mesh.vertex_colors = o3d.utility.Vector3dVector(np.vstack(all_colors))
+    
+        # Compute normals for better visualization
+        combined_mesh.compute_vertex_normals()
+    
+        print(f"  Final mesh: {len(combined_mesh.vertices)} vertices, {len(combined_mesh.triangles)} triangles")
+    
+        return combined_mesh
+    def _convert_cluster_to_lego(self, button: ViewerButton):
+        """
+        Convert isolated cluster gaussians to LEGO brick mesh.
+        This is the main callback function for the "Convert Cluster to LEGO Mesh" button.
+        """
+        if self.isolated_cluster_indices is None or self.selected_cluster_id is None:
+            print("No isolated cluster to convert.")
+            return
+    
+        print("\n" + "="*60)
+        print("STARTING LEGO CONVERSION")
+        print("="*60)
+    
+        # Get configuration
+        voxel_size = self.config.lego_voxel_size
+        min_brick_size = self.config.lego_min_brick_size
+        max_brick_size = self.config.lego_max_brick_size
+        enable_merging = self.config.lego_enable_merging
+    
+        print(f"Configuration:")
+        print(f"  Voxel size: {voxel_size}")
+        print(f"  Brick size range: {min_brick_size}x{min_brick_size}x1 to {max_brick_size}x{max_brick_size}x1")
+        print(f"  Merging enabled: {enable_merging}")
+        print()
+    
+        # Step 1: Voxelize
+        start_time = time.time()
+        voxel_grid, color_grid, origin, grid_shape = self._voxelize_cluster_gaussians(voxel_size)
+    
+        if voxel_grid is None:
+            return
+    
+        voxel_time = time.time() - start_time
+        print(f"✓ Voxelization completed in {voxel_time:.2f}s\n")
+    
+        # Step 2: Place LEGO bricks
+        start_time = time.time()
+        bricks = self._place_lego_bricks(
+            voxel_grid, 
+            color_grid,
+            min_brick_size=min_brick_size,
+            max_brick_size=max_brick_size,
+            enable_merging=enable_merging
+        )
+        brick_time = time.time() - start_time
+        print(f"✓ Brick placement completed in {brick_time:.2f}s\n")
+    
+        # Step 3: Generate mesh
+        start_time = time.time()
+        lego_mesh = self._generate_lego_mesh(bricks, voxel_size, origin)
+        mesh_time = time.time() - start_time
+        print(f"✓ Mesh generation completed in {mesh_time:.2f}s\n")
+    
+        # Step 4: Save outputs
+        output_dir = Path(f"outputs/{self.datamanager.config.dataparser.data.name}/cluster_{self.selected_cluster_id}_export")
+        output_dir.mkdir(parents=True, exist_ok=True)
+    
+        # Save as PLY
+        ply_file = output_dir / f"cluster_{self.selected_cluster_id}_lego_mesh.ply"
+        o3d.io.write_triangle_mesh(str(ply_file), lego_mesh)
+        print(f"✓ Saved LEGO mesh (PLY): {ply_file}")
+    
+        # Save as OBJ
+        obj_file = output_dir / f"cluster_{self.selected_cluster_id}_lego_mesh.obj"
+        o3d.io.write_triangle_mesh(str(obj_file), lego_mesh)
+        print(f"✓ Saved LEGO mesh (OBJ): {obj_file}")
+    
+        # Save metadata
+        metadata = {
+            "cluster_id": int(self.selected_cluster_id),
+            "num_bricks": len(bricks),
+            "voxel_size": float(voxel_size),
+            "grid_shape": grid_shape.tolist(),
+            "origin": origin.tolist(),
+            "vertices": len(lego_mesh.vertices),
+            "triangles": len(lego_mesh.triangles),
+            "processing_time": {
+                "voxelization": float(voxel_time),
+                "brick_placement": float(brick_time),
+                "mesh_generation": float(mesh_time),
+                "total": float(voxel_time + brick_time + mesh_time)
+            }
+        }
+    
+        metadata_file = output_dir / f"cluster_{self.selected_cluster_id}_lego_metadata.json"
+        with open(metadata_file, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        print(f"✓ Saved metadata: {metadata_file}")
+    
+        print("\n" + "="*60)
+        print("LEGO CONVERSION COMPLETED")
+        print("="*60)
+        print(f"Total bricks: {len(bricks)}")
+        print(f"Total vertices: {len(lego_mesh.vertices)}")
+        print(f"Total triangles: {len(lego_mesh.triangles)}")
+        print(f"Output directory: {output_dir}")
+        print("="*60 + "\n")

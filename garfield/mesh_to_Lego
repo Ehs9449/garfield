@@ -1,0 +1,14 @@
+    # Convert clustered Gaussians to voxel grid
+    def gaussians_to_voxels(gaussians, resolution=64):
+        voxel_grid = np.zeros((resolution, resolution, resolution))
+    
+        for gaussian in gaussians:
+            # Sample density from each gaussian
+            # Convert to occupancy
+            voxel_grid += gaussian_contribution
+    
+        # Threshold to binary occupancy
+        occupied = voxel_grid > threshold
+        return occupied
+
+
