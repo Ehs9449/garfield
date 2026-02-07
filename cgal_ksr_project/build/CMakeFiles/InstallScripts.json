@@ -1,7 +1,7 @@
 {
 	"InstallScripts" : 
 	[
-		"/home/eaghae1/cgal_ksr_project/build/cmake_install.cmake"
+		"/home/eaghae1/garfield/cgal_ksr_project/build/cmake_install.cmake"
 	],
 	"Parallel" : false
 }

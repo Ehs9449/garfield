@@ -1,3 +1,5 @@
-/home/eaghae1/cgal_ksr_project/build/CMakeFiles/ksr_building.dir
-/home/eaghae1/cgal_ksr_project/build/CMakeFiles/edit_cache.dir
-/home/eaghae1/cgal_ksr_project/build/CMakeFiles/rebuild_cache.dir
+/home/eaghae1/garfield/cgal_ksr_project/build/CMakeFiles/ksr_building.dir
+/home/eaghae1/garfield/cgal_ksr_project/build/CMakeFiles/ransac_detection.dir
+/home/eaghae1/garfield/cgal_ksr_project/build/CMakeFiles/region_growing_detection.dir
+/home/eaghae1/garfield/cgal_ksr_project/build/CMakeFiles/edit_cache.dir
+/home/eaghae1/garfield/cgal_ksr_project/build/CMakeFiles/rebuild_cache.dir

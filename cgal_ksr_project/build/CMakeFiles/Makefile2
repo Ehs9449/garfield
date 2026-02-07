@@ -54,20 +54,24 @@ RM = /home/eaghae1/miniconda3/envs/cgal_env/bin/cmake -E rm -f
 EQUALS = =
 
 # The top-level source directory on which CMake was run.
-CMAKE_SOURCE_DIR = /home/eaghae1/cgal_ksr_project
+CMAKE_SOURCE_DIR = /home/eaghae1/garfield/cgal_ksr_project
 
 # The top-level build directory on which CMake was run.
-CMAKE_BINARY_DIR = /home/eaghae1/cgal_ksr_project/build
+CMAKE_BINARY_DIR = /home/eaghae1/garfield/cgal_ksr_project/build
 
 #=============================================================================
 # Directory level rules for the build root directory
 
 # The main recursive "all" target.
 all: CMakeFiles/ksr_building.dir/all
+all: CMakeFiles/ransac_detection.dir/all
+all: CMakeFiles/region_growing_detection.dir/all
 .PHONY : all
 
 # The main recursive "codegen" target.
 codegen: CMakeFiles/ksr_building.dir/codegen
+codegen: CMakeFiles/ransac_detection.dir/codegen
+codegen: CMakeFiles/region_growing_detection.dir/codegen
 .PHONY : codegen
 
 # The main recursive "preinstall" target.
@@ -76,6 +80,8 @@ preinstall:
 
 # The main recursive "clean" target.
 clean: CMakeFiles/ksr_building.dir/clean
+clean: CMakeFiles/ransac_detection.dir/clean
+clean: CMakeFiles/region_growing_detection.dir/clean
 .PHONY : clean
 
 #=============================================================================
@@ -85,14 +91,14 @@ clean: CMakeFiles/ksr_building.dir/clean
 CMakeFiles/ksr_building.dir/all:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/ksr_building.dir/build.make CMakeFiles/ksr_building.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/ksr_building.dir/build.make CMakeFiles/ksr_building.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/eaghae1/cgal_ksr_project/build/CMakeFiles --progress-num=1,2 "Built target ksr_building"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/eaghae1/garfield/cgal_ksr_project/build/CMakeFiles --progress-num=1,2 "Built target ksr_building"
 .PHONY : CMakeFiles/ksr_building.dir/all
 
 # Build rule for subdir invocation for target.
 CMakeFiles/ksr_building.dir/rule: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start /home/eaghae1/cgal_ksr_project/build/CMakeFiles 2
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/eaghae1/garfield/cgal_ksr_project/build/CMakeFiles 2
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 CMakeFiles/ksr_building.dir/all
-	$(CMAKE_COMMAND) -E cmake_progress_start /home/eaghae1/cgal_ksr_project/build/CMakeFiles 0
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/eaghae1/garfield/cgal_ksr_project/build/CMakeFiles 0
 .PHONY : CMakeFiles/ksr_building.dir/rule
 
 # Convenience name for target.
@@ -102,13 +108,77 @@ ksr_building: CMakeFiles/ksr_building.dir/rule
 # codegen rule for target.
 CMakeFiles/ksr_building.dir/codegen:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/ksr_building.dir/build.make CMakeFiles/ksr_building.dir/codegen
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/eaghae1/cgal_ksr_project/build/CMakeFiles --progress-num=1,2 "Finished codegen for target ksr_building"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/eaghae1/garfield/cgal_ksr_project/build/CMakeFiles --progress-num=1,2 "Finished codegen for target ksr_building"
 .PHONY : CMakeFiles/ksr_building.dir/codegen
 
 # clean rule for target.
 CMakeFiles/ksr_building.dir/clean:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/ksr_building.dir/build.make CMakeFiles/ksr_building.dir/clean
 .PHONY : CMakeFiles/ksr_building.dir/clean
+
+#=============================================================================
+# Target rules for target CMakeFiles/ransac_detection.dir
+
+# All Build rule for target.
+CMakeFiles/ransac_detection.dir/all:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ransac_detection.dir/build.make CMakeFiles/ransac_detection.dir/depend
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ransac_detection.dir/build.make CMakeFiles/ransac_detection.dir/build
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/eaghae1/garfield/cgal_ksr_project/build/CMakeFiles --progress-num=3,4 "Built target ransac_detection"
+.PHONY : CMakeFiles/ransac_detection.dir/all
+
+# Build rule for subdir invocation for target.
+CMakeFiles/ransac_detection.dir/rule: cmake_check_build_system
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/eaghae1/garfield/cgal_ksr_project/build/CMakeFiles 2
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 CMakeFiles/ransac_detection.dir/all
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/eaghae1/garfield/cgal_ksr_project/build/CMakeFiles 0
+.PHONY : CMakeFiles/ransac_detection.dir/rule
+
+# Convenience name for target.
+ransac_detection: CMakeFiles/ransac_detection.dir/rule
+.PHONY : ransac_detection
+
+# codegen rule for target.
+CMakeFiles/ransac_detection.dir/codegen:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ransac_detection.dir/build.make CMakeFiles/ransac_detection.dir/codegen
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/eaghae1/garfield/cgal_ksr_project/build/CMakeFiles --progress-num=3,4 "Finished codegen for target ransac_detection"
+.PHONY : CMakeFiles/ransac_detection.dir/codegen
+
+# clean rule for target.
+CMakeFiles/ransac_detection.dir/clean:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ransac_detection.dir/build.make CMakeFiles/ransac_detection.dir/clean
+.PHONY : CMakeFiles/ransac_detection.dir/clean
+
+#=============================================================================
+# Target rules for target CMakeFiles/region_growing_detection.dir
+
+# All Build rule for target.
+CMakeFiles/region_growing_detection.dir/all:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/region_growing_detection.dir/build.make CMakeFiles/region_growing_detection.dir/depend
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/region_growing_detection.dir/build.make CMakeFiles/region_growing_detection.dir/build
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/eaghae1/garfield/cgal_ksr_project/build/CMakeFiles --progress-num=5,6 "Built target region_growing_detection"
+.PHONY : CMakeFiles/region_growing_detection.dir/all
+
+# Build rule for subdir invocation for target.
+CMakeFiles/region_growing_detection.dir/rule: cmake_check_build_system
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/eaghae1/garfield/cgal_ksr_project/build/CMakeFiles 2
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 CMakeFiles/region_growing_detection.dir/all
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/eaghae1/garfield/cgal_ksr_project/build/CMakeFiles 0
+.PHONY : CMakeFiles/region_growing_detection.dir/rule
+
+# Convenience name for target.
+region_growing_detection: CMakeFiles/region_growing_detection.dir/rule
+.PHONY : region_growing_detection
+
+# codegen rule for target.
+CMakeFiles/region_growing_detection.dir/codegen:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/region_growing_detection.dir/build.make CMakeFiles/region_growing_detection.dir/codegen
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=/home/eaghae1/garfield/cgal_ksr_project/build/CMakeFiles --progress-num=5,6 "Finished codegen for target region_growing_detection"
+.PHONY : CMakeFiles/region_growing_detection.dir/codegen
+
+# clean rule for target.
+CMakeFiles/region_growing_detection.dir/clean:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/region_growing_detection.dir/build.make CMakeFiles/region_growing_detection.dir/clean
+.PHONY : CMakeFiles/region_growing_detection.dir/clean
 
 #=============================================================================
 # Special targets to cleanup operation of make.

@@ -57,10 +57,10 @@ RM = /home/eaghae1/miniconda3/envs/cgal_env/bin/cmake -E rm -f
 EQUALS = =
 
 # The top-level source directory on which CMake was run.
-CMAKE_SOURCE_DIR = /home/eaghae1/cgal_ksr_project
+CMAKE_SOURCE_DIR = /home/eaghae1/garfield/cgal_ksr_project
 
 # The top-level build directory on which CMake was run.
-CMAKE_BINARY_DIR = /home/eaghae1/cgal_ksr_project/build
+CMAKE_BINARY_DIR = /home/eaghae1/garfield/cgal_ksr_project/build
 
 #=============================================================================
 # Targets provided globally by CMake.
@@ -87,16 +87,16 @@ rebuild_cache/fast: rebuild_cache
 
 # The main all target
 all: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start /home/eaghae1/cgal_ksr_project/build/CMakeFiles /home/eaghae1/cgal_ksr_project/build//CMakeFiles/progress.marks
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/eaghae1/garfield/cgal_ksr_project/build/CMakeFiles /home/eaghae1/garfield/cgal_ksr_project/build//CMakeFiles/progress.marks
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 all
-	$(CMAKE_COMMAND) -E cmake_progress_start /home/eaghae1/cgal_ksr_project/build/CMakeFiles 0
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/eaghae1/garfield/cgal_ksr_project/build/CMakeFiles 0
 .PHONY : all
 
 # The main codegen target
 codegen: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start /home/eaghae1/cgal_ksr_project/build/CMakeFiles /home/eaghae1/cgal_ksr_project/build//CMakeFiles/progress.marks
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/eaghae1/garfield/cgal_ksr_project/build/CMakeFiles /home/eaghae1/garfield/cgal_ksr_project/build//CMakeFiles/progress.marks
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 codegen
-	$(CMAKE_COMMAND) -E cmake_progress_start /home/eaghae1/cgal_ksr_project/build/CMakeFiles 0
+	$(CMAKE_COMMAND) -E cmake_progress_start /home/eaghae1/garfield/cgal_ksr_project/build/CMakeFiles 0
 .PHONY : codegen
 
 # The main clean target
@@ -136,6 +136,32 @@ ksr_building/fast:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/ksr_building.dir/build.make CMakeFiles/ksr_building.dir/build
 .PHONY : ksr_building/fast
 
+#=============================================================================
+# Target rules for targets named ransac_detection
+
+# Build rule for target.
+ransac_detection: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 ransac_detection
+.PHONY : ransac_detection
+
+# fast build rule for target.
+ransac_detection/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ransac_detection.dir/build.make CMakeFiles/ransac_detection.dir/build
+.PHONY : ransac_detection/fast
+
+#=============================================================================
+# Target rules for targets named region_growing_detection
+
+# Build rule for target.
+region_growing_detection: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 region_growing_detection
+.PHONY : region_growing_detection
+
+# fast build rule for target.
+region_growing_detection/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/region_growing_detection.dir/build.make CMakeFiles/region_growing_detection.dir/build
+.PHONY : region_growing_detection/fast
+
 ksr_building.o: ksr_building.cpp.o
 .PHONY : ksr_building.o
 
@@ -160,6 +186,54 @@ ksr_building.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/ksr_building.dir/build.make CMakeFiles/ksr_building.dir/ksr_building.cpp.s
 .PHONY : ksr_building.cpp.s
 
+ransac_detection.o: ransac_detection.cpp.o
+.PHONY : ransac_detection.o
+
+# target to build an object file
+ransac_detection.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ransac_detection.dir/build.make CMakeFiles/ransac_detection.dir/ransac_detection.cpp.o
+.PHONY : ransac_detection.cpp.o
+
+ransac_detection.i: ransac_detection.cpp.i
+.PHONY : ransac_detection.i
+
+# target to preprocess a source file
+ransac_detection.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ransac_detection.dir/build.make CMakeFiles/ransac_detection.dir/ransac_detection.cpp.i
+.PHONY : ransac_detection.cpp.i
+
+ransac_detection.s: ransac_detection.cpp.s
+.PHONY : ransac_detection.s
+
+# target to generate assembly for a file
+ransac_detection.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ransac_detection.dir/build.make CMakeFiles/ransac_detection.dir/ransac_detection.cpp.s
+.PHONY : ransac_detection.cpp.s
+
+region_growing_detection.o: region_growing_detection.cpp.o
+.PHONY : region_growing_detection.o
+
+# target to build an object file
+region_growing_detection.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/region_growing_detection.dir/build.make CMakeFiles/region_growing_detection.dir/region_growing_detection.cpp.o
+.PHONY : region_growing_detection.cpp.o
+
+region_growing_detection.i: region_growing_detection.cpp.i
+.PHONY : region_growing_detection.i
+
+# target to preprocess a source file
+region_growing_detection.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/region_growing_detection.dir/build.make CMakeFiles/region_growing_detection.dir/region_growing_detection.cpp.i
+.PHONY : region_growing_detection.cpp.i
+
+region_growing_detection.s: region_growing_detection.cpp.s
+.PHONY : region_growing_detection.s
+
+# target to generate assembly for a file
+region_growing_detection.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/region_growing_detection.dir/build.make CMakeFiles/region_growing_detection.dir/region_growing_detection.cpp.s
+.PHONY : region_growing_detection.cpp.s
+
 # Help Target
 help:
 	@echo "The following are some of the valid targets for this Makefile:"
@@ -170,9 +244,17 @@ help:
 	@echo "... edit_cache"
 	@echo "... rebuild_cache"
 	@echo "... ksr_building"
+	@echo "... ransac_detection"
+	@echo "... region_growing_detection"
 	@echo "... ksr_building.o"
 	@echo "... ksr_building.i"
 	@echo "... ksr_building.s"
+	@echo "... ransac_detection.o"
+	@echo "... ransac_detection.i"
+	@echo "... ransac_detection.s"
+	@echo "... region_growing_detection.o"
+	@echo "... region_growing_detection.i"
+	@echo "... region_growing_detection.s"
 .PHONY : help
 
 
