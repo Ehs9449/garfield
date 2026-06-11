@@ -548,134 +548,377 @@ class GarfieldGaussianPipeline(VanillaPipeline):
         self.cluster_scene_shuffle_colors.set_disabled(False)
 
     def _cluster_scene(self, button: ViewerButton):
-        """Cluster the scene, and assign gaussian colors based on the clusters.
-        Also populates self.crop_group_list with the clusters group indices."""
+        """
+        APPROACH 3: Render GARField feature maps from multiple views,
+        project Gaussian centers into those views, look up smooth rendered 
+        features, average across views, then cluster.
+        """
 
-        self._queue_state()  # Save current state
-        self.cluster_scene.set_disabled(True)  # Disable user from clustering, while clustering
+        self._queue_state()
+        self.cluster_scene.set_disabled(True)
 
         scale = self.cluster_scene_scale.value
-        grouping_model = self.garfield_pipeline[0].model
-        
-        positions_t = self.model.gauss_params['means'].detach()  # tensor on model device (likely GPU)
-        # move positions to CPU for grouping model (which we kept on CPU earlier)
-        positions_cpu = positions_t.cpu()
-        N = positions_cpu.shape[0]
-        batch_size = 8192  # tune down if still high memory; smaller = less peak RAM
-        feats_list = []
-        for s_i in range(0, N, batch_size):
-            p_batch = positions_cpu[s_i : s_i + batch_size]  # CPU tensor
-            # move the batch to the grouping device (GPU if available)
-            _p_in = p_batch.to(self._grouping_device)
-            with torch.no_grad():
-                f_batch = grouping_model.get_grouping_at_points(_p_in, scale)
-            # move outputs back to CPU / numpy
-            if isinstance(f_batch, torch.Tensor):
-                f_batch = f_batch.cpu().numpy()
-            feats_list.append(f_batch)
+        garfield_model = self.garfield_pipeline[0].model
+        garfield_model.eval()
 
-        group_feats = np.concatenate(feats_list, axis=0)
-        positions = positions_cpu.numpy()
+        # Set the scale slider on the GARField model so it renders at the chosen scale
+        garfield_model.scale_slider.value = scale
 
+        positions_t = self.model.gauss_params['means'].detach()
 
+        ############################################################
+        # STEP 1: Filter sky/background Gaussians
+        ############################################################
+        print("Step 1: Filtering sky/background Gaussians...")
+
+        opacities = self.model.gauss_params['opacities'].detach().cpu().numpy().squeeze()
+        opacity_mask = opacities > -1.0
+
+        positions_np_all = positions_t.cpu().numpy()
+        spatial_mask = np.ones(len(positions_np_all), dtype=bool)
+        for dim in range(3):
+            mean_d = positions_np_all[:, dim].mean()
+            std_d = positions_np_all[:, dim].std()
+            spatial_mask &= (positions_np_all[:, dim] > mean_d - 2 * std_d)
+            spatial_mask &= (positions_np_all[:, dim] < mean_d + 2 * std_d)
+
+        valid_mask = opacity_mask & spatial_mask
+        positions_filtered = positions_t[valid_mask]  # on GPU
+        positions_filtered_np = positions_filtered.cpu().numpy()
+
+        print(f"  Original: {len(positions_t)} Gaussians")
+        print(f"  After filtering: {len(positions_filtered)} Gaussians")
+        print(f"  Removed: {len(positions_t) - len(positions_filtered)}")
+
+        ############################################################
+        # STEP 2: Get training camera poses from GARField's datamanager
+        ############################################################
+        print("Step 2: Getting training camera poses...")
+
+        garfield_datamanager = self.garfield_pipeline[0].datamanager
+        train_dataset = garfield_datamanager.train_dataset
+
+        # Get all training cameras
+        cameras = train_dataset.cameras
+        num_images = len(cameras)
+
+        # Select a subset of views (every Nth image to keep it manageable)
+        # Use more views for better coverage, fewer for speed
+        step = max(1, num_images // 50)  # Use ~50 views
+        view_indices = list(range(0, num_images, step))
+        print(f"  Total training images: {num_images}")
+        print(f"  Using {len(view_indices)} views (every {step}th)")
+
+        ############################################################
+        # STEP 3: Render GARField features from each view
+        # and project Gaussian centers into rendered feature maps
+        ############################################################
+        print("Step 3: Rendering features and projecting points...")
+
+        N_points = len(positions_filtered)
+        feature_sum = np.zeros((N_points, 256), dtype=np.float32)
+        feature_count = np.zeros(N_points, dtype=np.int32)
+
+        for view_idx_num, img_idx in enumerate(view_indices):
+            try:
+                # Get camera for this view
+                camera = cameras[img_idx:img_idx+1].to(self._grouping_device)
+
+                # Render GARField outputs for this view
+                with torch.no_grad():
+                    outputs = garfield_model.get_outputs_for_camera_ray_bundle(
+                        camera.generate_rays(camera_indices=0)
+                    )
+
+                # Get rendered feature map and depth
+                if "instance" not in outputs:
+                    print(f"  View {view_idx_num}: no instance features, skipping")
+                    continue
+
+                feature_map = outputs["instance"].cpu().numpy()  # H x W x 256
+                depth_map = outputs["depth"].cpu().numpy()        # H x W x 1
+
+                H, W = feature_map.shape[0], feature_map.shape[1]
+
+                # Get camera intrinsics and extrinsics
+                c2w = camera.camera_to_worlds[0].cpu().numpy()  # 3x4
+                # Build 4x4
+                c2w_4x4 = np.eye(4, dtype=np.float32)
+                c2w_4x4[:3, :] = c2w
+
+                w2c = np.linalg.inv(c2w_4x4)  # 4x4 world-to-camera
+                R = w2c[:3, :3]
+                t = w2c[:3, 3]
+
+                fx = camera.fx[0].item()
+                fy = camera.fy[0].item()
+                cx = camera.cx[0].item()
+                cy = camera.cy[0].item()
+
+                # Build intrinsic matrix
+                K = np.array([
+                    [fx, 0, cx],
+                    [0, fy, cy],
+                    [0, 0, 1]
+                ], dtype=np.float32)
+
+                # Project all filtered Gaussian positions into this view
+                # Transform to camera coordinates
+                points_cam = (R @ positions_filtered_np.T + t.reshape(3, 1)).T  # N x 3
+
+                # Only keep points in front of camera
+                in_front = points_cam[:, 2] > 0
+                if in_front.sum() == 0:
+                    continue
+
+                # Project to pixel coordinates
+                points_proj = (K @ points_cam.T).T  # N x 3
+                px = (points_proj[:, 0] / points_proj[:, 2]).astype(np.int32)
+                py = (points_proj[:, 1] / points_proj[:, 2]).astype(np.int32)
+                proj_depth = points_proj[:, 2]
+
+                # Check which points fall within image bounds
+                in_bounds = (px >= 0) & (px < W) & (py >= 0) & (py < H) & in_front
+
+                if in_bounds.sum() == 0:
+                    continue
+
+                # Visibility check: compare projected depth with rendered depth
+                valid_px = px[in_bounds]
+                valid_py = py[in_bounds]
+                valid_depth = proj_depth[in_bounds]
+
+                rendered_depth = depth_map[valid_py, valid_px, 0]
+
+                # Point is visible if its depth is close to the rendered depth
+                depth_tolerance = 0.1  # Adjust if needed
+                depth_diff = np.abs(valid_depth - rendered_depth)
+                visible = depth_diff < depth_tolerance
+
+                if visible.sum() == 0:
+                    # Try larger tolerance
+                    depth_tolerance = 0.3
+                    visible = depth_diff < depth_tolerance
+
+                if visible.sum() == 0:
+                    continue
+
+                # Get the indices of visible points in the filtered array
+                in_bounds_indices = np.where(in_bounds)[0]
+                visible_indices = in_bounds_indices[visible]
+                visible_px = valid_px[visible]
+                visible_py = valid_py[visible]
+
+                # Look up features at projected pixel locations
+                looked_up_features = feature_map[visible_py, visible_px, :]  # N_visible x 256
+
+                # Accumulate features
+                feature_sum[visible_indices] += looked_up_features
+                feature_count[visible_indices] += 1
+
+                n_visible = visible.sum()
+                if (view_idx_num + 1) % 10 == 0 or view_idx_num == 0:
+                    print(f"  View {view_idx_num+1}/{len(view_indices)}: "
+                          f"{n_visible} visible points ({100*n_visible/N_points:.1f}%)")
+
+            except Exception as e:
+                print(f"  View {view_idx_num}: ERROR - {e}")
+                continue
+
+        ############################################################
+        # STEP 4: Average features across views
+        ############################################################
+        print("Step 4: Averaging features across views...")
+
+        # Avoid division by zero
+        has_features = feature_count > 0
+        print(f"  Points with features: {has_features.sum()} / {N_points} "
+              f"({100*has_features.sum()/N_points:.1f}%)")
+
+        if has_features.sum() < 100:
+            print("ERROR: Too few points got features. Check camera poses and depth tolerance.")
+            self.cluster_scene.set_disabled(False)
+            return
+
+        # Average the accumulated features
+        avg_features = np.zeros_like(feature_sum)
+        avg_features[has_features] = feature_sum[has_features] / feature_count[has_features, np.newaxis]
+
+        # For points without features, assign the feature of the nearest point that has features
+        if (~has_features).sum() > 0:
+            print(f"  Assigning features to {(~has_features).sum()} points without view coverage...")
+            nn_fill = NearestNeighbors(n_neighbors=1, algorithm='auto')
+            nn_fill.fit(positions_filtered_np[has_features])
+            _, fill_indices = nn_fill.kneighbors(positions_filtered_np[~has_features])
+            avg_features[~has_features] = avg_features[has_features][fill_indices[:, 0]]
+
+        group_feats = avg_features
+        positions = positions_filtered_np
+
+        print(f"  Feature stats: min={group_feats.min():.3f}, max={group_feats.max():.3f}, "
+              f"mean={group_feats.mean():.3f}")
+
+        ############################################################
+        # STEP 5: Downsample before clustering
+        ############################################################
+        print("Step 5: Downsampling for clustering...")
         start = time.time()
-
-        # Cluster the gaussians using HDBSCAN.
-        # We will first cluster the downsampled gaussians, then 
-        #  assign the full gaussians to the spatially closest downsampled gaussian.
 
         vec_o3d = o3d.utility.Vector3dVector(positions)
         pc_o3d = o3d.geometry.PointCloud(vec_o3d)
         min_bound = np.clip(pc_o3d.get_min_bound(), -1, 1)
         max_bound = np.clip(pc_o3d.get_max_bound(), -1, 1)
-        # downsample size to be a percent of the bounding box extent
-        downsample_size = 0.01 * scale
+        downsample_size = 0.01 * max(scale, 0.01)
         pc, _, ids = pc_o3d.voxel_down_sample_and_trace(
             max(downsample_size, 0.0001), min_bound, max_bound
         )
-        if len(ids) > 1e6:
-            print(f"Too many points ({len(ids)}) to cluster... aborting.")
-            print( "Consider using interactive select to reduce points before clustering.")
-            print( "Are you sure you want to cluster? Press y to continue, else return.")
-            # wait for input to continue, if yes then continue, else return
-            if input() != "y":
-                self.cluster_scene.set_disabled(False)
-                return
 
-        id_vec = np.array([points[0] for points in ids])  # indices of gaussians kept after downsampling
+        id_vec = np.array([points[0] for points in ids])
         group_feats_downsampled = group_feats[id_vec]
         positions_downsampled = np.array(pc.points)
 
-        print(f"Clustering {group_feats_downsampled.shape[0]} gaussians... ", end="", flush=True)
+        print(f"  Downsampled to {len(id_vec)} points")
 
-        # Run cuml-based HDBSCAN
-        clusterer = HDBSCAN(
-            cluster_selection_epsilon=0.1,
-            min_samples=30,
-            min_cluster_size=30,
-            allow_single_cluster=True,
-        ).fit(group_feats_downsampled)
+        ############################################################
+        # STEP 6: HDBSCAN with parameter search
+        ############################################################
+        print("Step 6: Clustering with parameter search...")
+
+        from sklearn.metrics import silhouette_score
+
+        best_score = -1
+        best_labels = None
+        best_params = None
+
+        for min_cluster_size in [50, 100, 200, 500]:
+            for min_samples in [10, 20, 30]:
+                try:
+                    clusterer = HDBSCAN(
+                        min_cluster_size=min_cluster_size,
+                        min_samples=min_samples,
+                        cluster_selection_epsilon=0.1,
+                        allow_single_cluster=False,
+                    ).fit(group_feats_downsampled)
+
+                    temp_labels = clusterer.labels_.copy()
+                    n_clusters = len(set(temp_labels)) - (1 if -1 in temp_labels else 0)
+
+                    if n_clusters < 2:
+                        print(f"  min_cluster={min_cluster_size}, min_samples={min_samples}: "
+                              f"only {n_clusters} cluster(s), skipping")
+                        continue
+
+                    valid = temp_labels >= 0
+                    if valid.sum() < 100:
+                        continue
+
+                    score = silhouette_score(
+                        group_feats_downsampled[valid],
+                        temp_labels[valid],
+                        sample_size=min(5000, int(valid.sum()))
+                    )
+
+                    noise_pct = 100 * (temp_labels == -1).sum() / len(temp_labels)
+
+                    print(f"  min_cluster={min_cluster_size}, min_samples={min_samples}: "
+                          f"{n_clusters} clusters, silhouette={score:.3f}, noise={noise_pct:.1f}%")
+
+                    if score > best_score:
+                        best_score = score
+                        best_labels = temp_labels.copy()
+                        best_params = (min_cluster_size, min_samples)
+
+                except Exception as e:
+                    print(f"  min_cluster={min_cluster_size}, min_samples={min_samples}: ERROR - {e}")
+                    continue
+
+        if best_labels is None:
+            print("No valid clustering found! Falling back to default...")
+            clusterer = HDBSCAN(
+                cluster_selection_epsilon=0.1,
+                min_samples=30,
+                min_cluster_size=30,
+                allow_single_cluster=True,
+            ).fit(group_feats_downsampled)
+            best_labels = clusterer.labels_.copy()
+            best_params = (30, 30)
+
+        print(f"\n  BEST: min_cluster={best_params[0]}, min_samples={best_params[1]}, "
+              f"silhouette={best_score:.3f}")
+
+        labels = best_labels
+
+        ############################################################
+        # STEP 7: Assign non-downsampled points to nearest cluster
+        ############################################################
+        print("Step 7: Assigning remaining points to clusters...")
 
         non_clustered = np.ones(positions.shape[0], dtype=bool)
         non_clustered[id_vec] = False
-        labels = clusterer.labels_.copy()
-        clusterer.labels_ = -np.ones(positions.shape[0], dtype=np.int32)
-        clusterer.labels_[id_vec] = labels
 
-        # Assign the full gaussians to the spatially closest downsampled gaussian, with scipy NearestNeighbors.
-        positions_np = positions[non_clustered]
-        if positions_np.shape[0] > 0:  # i.e., if there were points removed during downsampling
-            k = 1
+        all_filtered_labels = -np.ones(positions.shape[0], dtype=np.int32)
+        all_filtered_labels[id_vec] = labels
+
+        positions_non_clustered = positions[non_clustered]
+        if positions_non_clustered.shape[0] > 0:
             nn_model = NearestNeighbors(
-                n_neighbors=k, algorithm="auto", metric="euclidean"
+                n_neighbors=1, algorithm="auto", metric="euclidean"
             ).fit(positions_downsampled)
-            _, indices = nn_model.kneighbors(positions_np)
-            clusterer.labels_[non_clustered] = labels[indices[:, 0]]
+            _, indices = nn_model.kneighbors(positions_non_clustered)
+            all_filtered_labels[non_clustered] = labels[indices[:, 0]]
 
-        labels = clusterer.labels_
-        print(f"done. Took {time.time()-start} seconds. Found {labels.max() + 1} clusters.")
+        ############################################################
+        # STEP 8: Map labels back to ALL original Gaussians
+        ############################################################
+        print("Step 8: Mapping labels back to all Gaussians...")
 
+        full_labels = -np.ones(len(positions_t), dtype=np.int32)
+        valid_indices = np.where(valid_mask)[0]
+        full_labels[valid_indices] = all_filtered_labels
+
+        labels = full_labels
+
+        # Handle noise labels
         noise_mask = labels == -1
-        if noise_mask.sum() != 0 and (labels>=0).sum() > 0:
-            # if there is noise, but not all of it is noise, relabel the noise
-            valid_mask = labels >=0
-            valid_positions = positions[valid_mask]
-            k = 1
+        if noise_mask.sum() != 0 and (labels >= 0).sum() > 0:
+            valid_label_mask = labels >= 0
+            valid_positions_for_nn = positions_np_all[valid_label_mask]
             nn_model = NearestNeighbors(
-                n_neighbors=k, algorithm="auto", metric="euclidean"
-            ).fit(valid_positions)
-            noise_positions = positions[noise_mask]
+                n_neighbors=1, algorithm="auto", metric="euclidean"
+            ).fit(valid_positions_for_nn)
+            noise_positions = positions_np_all[noise_mask]
             _, indices = nn_model.kneighbors(noise_positions)
-            # for now just pick the closest cluster
-            noise_relabels = labels[valid_mask][indices[:, 0]]
+            noise_relabels = labels[valid_label_mask][indices[:, 0]]
             labels[noise_mask] = noise_relabels
-            clusterer.labels_ = labels
 
-        labels = clusterer.labels_
+        n_final_clusters = labels.max() + 1
+        print(f"\nClustering complete! Found {n_final_clusters} clusters in {time.time()-start:.1f} seconds.")
 
+        ############################################################
+        # Assign colors
+        ############################################################
         colormap = self.colormap
 
-        opacities = self.model.gauss_params['opacities'].detach()
-        opacities[labels < 0] = -100  # hide unclustered gaussians
-        self.model.gauss_params['opacities'] = torch.nn.Parameter(opacities.float())
+        opacities_param = self.model.gauss_params['opacities'].detach()
+        opacities_param[labels < 0] = -100
+        self.model.gauss_params['opacities'] = torch.nn.Parameter(opacities_param.float())
 
         self.cluster_labels = torch.Tensor(labels)
         features_dc = self.model.gauss_params['features_dc'].detach()
         features_rest = self.model.gauss_params['features_rest'].detach()
         for c_id in range(0, labels.max() + 1):
-            # set the colors of the gaussians accordingly using colormap from matplotlib
             cluster_mask = np.where(labels == c_id)
             features_dc[cluster_mask] = RGB2SH(colormap[c_id, :3].to(self.model.gauss_params['features_dc']))
             features_rest[cluster_mask] = 0
 
         self.model.gauss_params['features_dc'] = torch.nn.Parameter(self.model.gauss_params['features_dc'])
         self.model.gauss_params['features_rest'] = torch.nn.Parameter(self.model.gauss_params['features_rest'])
-        # Enable cluster selection after clustering completes
+
         self.select_cluster_by_click.set_disabled(False)
         self.select_cluster_by_click.set_hidden(False)
         self.num_render_views.set_hidden(False)
         self.cluster_scene.set_disabled(False)
-        self.viewer_control.viewer._trigger_rerender()  # trigger viewer rerender
+        self.viewer_control.viewer._trigger_rerender()
 
     def _export_visible_gaussians(self, button: ViewerButton):
         """Export the visible gaussians to a .ply file"""

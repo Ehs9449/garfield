@@ -1,4 +1,15 @@
-# ignore all __pycache__ directories, in .gitignore
-__pycache__/
-*.egg-info/
+# Data (too large for git)
+data/
+exports/
 outputs/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Temp files
+*.bak
+.DS_Store
+Downloads/
+.snakemake/

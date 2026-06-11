@@ -18,7 +18,7 @@ from nerfstudio.configs import base_config as cfg
 class ImgGroupModelConfig(cfg.InstantiateConfig):
     _target: Type = field(default_factory=lambda: ImgGroupModel)
     """target class to instantiate"""
-    model_type: Literal["sam_fb", "sam_hf", "maskformer"] = "sam_fb"
+    model_type: Literal["sam_fb", "sam_hf", "maskformer", "sam2"] = "sam2"
     """
     Currently supports:
      - "sam_fb": Original SAM model (from facebook github)
@@ -26,8 +26,8 @@ class ImgGroupModelConfig(cfg.InstantiateConfig):
      - "maskformer": MaskFormer model from huggingface (experimental)
     """
 
-    sam_model_type: str = "vit_b"
-    sam_model_ckpt: str = "/home/eaghae1/SAM-Adapter-PyTorch/save/_cod-sam-vit-b/model_epoch_best.pth"
+    sam_model_type: str = "/home/eaghae1/sam2/checkpoints/sam2.1_hiera_l.yaml"
+    sam_model_ckpt: str = "/home/eaghae1/sam2/checkpoints/checkpoint.pt"
     sam_kwargs: dict = field(default_factory=lambda: {})
     "Arguments for SAM model (fb)."
 
@@ -96,6 +96,30 @@ class ImgGroupModel:
                 (np.array(m['mask']) != 0)
                 for m in masks
             ]
+            masks = sorted(masks, key=lambda x: x.sum())
+            return masks
+        
+        elif self.config.model_type == "sam2":
+            if self.model is None:
+            # Requires the 'sam2' library installed
+                from sam2.build_sam import build_sam2
+                from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+        
+            # Build the model using the YAML and Checkpoint
+                sam2_model = build_sam2(
+                    self.config.sam2_config, 
+                    self.config.sam_model_ckpt, 
+                    device=self.device
+                )
+        
+                self.model = SAM2AutomaticMaskGenerator(
+                    model=sam2_model, 
+                    **self.config.sam_kwargs
+                )
+        
+            # Generate masks (logic remains similar to sam_fb)
+            masks = self.model.generate(img)
+            masks = [m['segmentation'] for m in masks]
             masks = sorted(masks, key=lambda x: x.sum())
             return masks
 

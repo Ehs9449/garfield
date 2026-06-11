@@ -1,110 +1,172 @@
-# <img src="https://www.garfield.studio/data/favicon.png" height="30px"> GARField: Group Anything with Radiance Fields
+# GARField-Semantic: Drone-to-BIM Semantic Segmentation Pipeline
 
-This is the official implementation for [GARField](https://www.garfield.studio).
+Automatic semantic segmentation of building components from drone imagery using GARField (Group Anything with Radiance Fields), 3D Gaussian Splatting, and domain-adapted SAM 3.
 
-Tested on Python 3.10, cuda 12.0, using conda. 
+> Forked from [chungmin99/garfield](https://github.com/chungmin99/garfield)
 
-<div align='center'>
-<img src="https://www.garfield.studio/data/garfield_training.jpg" height="230px">
-</div>
-
-## Installation
-1. Install nerfstudio from source, and its dependencies. This project requires the latest version of nerfstudio
-(more specifically, the new viewer based on viser).
-```
-# install dependencies
-pip3 install torch torchvision torchaudio
-conda install -c "nvidia/label/cuda-12.0.0" cuda-toolkit
-pip install ninja git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch
-
-# install nerfstudio!
-git clone git@github.com:nerfstudio-project/nerfstudio.git
-cd nerfstudio
-pip install -e .
-```
-
-2. To use GARField with Gaussian Splatting, [`cuml`](https://docs.rapids.ai/install) is required (for global clustering).
-The best way to install it is through conda: `conda install -c rapidsai -c conda-forge -c nvidia cuml`
-
-, or with pip: `pip install --extra-index-url=https://pypi.nvidia.com cudf-cu12==24.2.* cuml-cu12==24.2.*`.
-
-Important: I used [`libmamba`](https://www.anaconda.com/blog/a-faster-conda-for-a-growing-community) for conda. I have been told multiple times that the conda solver is very slow / gets stuck, but this seems to be key. 
-
-If you get `ClobberError`, try `conda clean --all` -- see [here](https://stackoverflow.com/questions/51217876/conda-update-anaconda-fails-clobbererror). It seems that `pip` installed packages from `nerfstudio` may conflict with the `conda` install here. 
-
-3. Install GARField!
-```
-git clone git@github.com:chungmin99/garfield.git
-pip install -e .
-```
-
-This installs both `garfield` (NeRF geometry), and `garfield-gauss` (Gaussian geometry).
-Note that `garfield-gauss` requires reference to a fully trained `garfield` checkpoint,
-as it relies on the affinity field from `garfield`. See the main paper for more details.
-
-4. (Optional) If you wish to use a different version of the SAM model (by default, the Hugging Face Transformer's SAM model facebook/sam-vit-huge is used), please install the 'segment_anything' package.
+## Pipeline Overview
 
 ```
-pip install git+https://github.com/facebookresearch/segment-anything.git
+                                    ┌─────────────────────┐
+                                    │   Drone Images      │
+                                    └─────────┬───────────┘
+                                              │
+                                    ┌─────────▼───────────┐
+                            Stage 1 │   COLMAP (SfM)      │
+                                    │   Camera poses +     │
+                                    │   sparse point cloud │
+                                    └─────────┬───────────┘
+                                              │
+                              ┌───────────────┴───────────────┐
+                              │                               │
+                    ┌─────────▼───────────┐        ┌──────────▼──────────┐
+            Stage 2a│   GARField (NeRF)   │ Stage 2b│  GARField-Gauss    │
+                    │   256-dim grouping  │        │  Gaussian Splatting │
+                    │   features          │        │  RGB rendering      │
+                    └─────────┬───────────┘        └──────────┬──────────┘
+                              │                               │
+                    ┌─────────▼───────────┐        ┌──────────▼──────────┐
+            Stage 3 │  Ortho Projection   │ Stage 5 │  Render 21 Views   │
+                    │  37 views → 256-dim │        │  for SAM 3 labeling│
+                    │  features on points │        └──────────┬──────────┘
+                    └─────────┬───────────┘                   │
+                              │                    ┌──────────▼──────────┐
+                    ┌─────────▼───────────┐ Stage 6 │  SAM 3 PCS (HPC)  │
+            Stage 4 │  HDBSCAN Clustering │        │  Fine-tuned on HDB│
+                    │  61 clusters        │        │  Text-prompted     │
+                    └─────────┬───────────┘        └──────────┬──────────┘
+                              │                               │
+                              └───────────────┬───────────────┘
+                                              │
+                                    ┌─────────▼───────────┐
+                            Stage 7 │  Cluster Matching   │
+                                    │  IoU + majority vote│
+                                    └─────────┬───────────┘
+                                              │
+                                    ┌─────────▼───────────┐
+                                    │ Semantic Point Cloud│
+                                    │ 267,979 labeled pts │
+                                    └─────────────────────┘
 ```
 
-## Running GARField
+| Stage | Description | Model | Environment |
+|-------|------------|-------|-------------|
+| 1. COLMAP | Structure from Motion | COLMAP | ColmapLnx |
+| 2a. GARField | Train grouping features (NeRF) | GARField | nerfstudio3 |
+| 2b. GARField-Gauss | Train Gaussian Splatting for rendering | GARField-Gauss | nerfstudio3 |
+| 3. Projection | Orthographic feature projection to point cloud | Uses 2a | nerfstudio3 |
+| 4. Clustering | HDBSCAN on GARField features | — | nerfstudio3 |
+| 5. Render | Generate labeling views | Uses 2b | nerfstudio3 |
+| 6. SAM 3 PCS | Text-prompted segmentation | Fine-tuned SAM 3 | sam3 (HPC) |
+| 7. Matching | Cluster-to-mask IoU matching + majority vote | — | nerfstudio3 |
 
-Note: using colmap-based image data makes it more convenient to run both `garfield` and `garfield-gauss` on the same dataset. Although `splatfacto` (Gaussian Splatting in nerfstudio) is supported with `NerfstudioDataParser`, and also supports random point initialization with non-colmap datasets, the NeRF and GS geometries will align better with colmap since 1) we will start from colmap points and 2) camera optimization is minimized.
+**Two parallel branches:** GARField (2a) provides grouping features for clustering. GARField-Gauss (2b) provides clean rendered views for SAM 3 labeling. Both branches merge at Stage 7 where cluster labels are assigned via majority voting.
 
-You can use it like any other third-party nerfstudio project.
-```
-ns-train garfield --data /your/data/here
-```
-Note that GARField will pause to generate groups using Segment-Anything at around 2000 steps
-(set by default, this can be set in GarfieldPipeline).
-Afterwards, you can start interacting with the affinity field.
-1. PCA visualization of affinity field: select `instance` as the output type,
-   and change the value of `scale` slider.
+## Quick Start
 
-https://github.com/chungmin99/garfield/assets/10284938/e193d7e8-da7c-4176-b7c5-a7ec75513c16
+### Prerequisites
 
-2. Affinity visualization between 3D point and scene: use "Click" button to
-   select the point, and select `instance_interact` as the output type. 
-   You might need to drag the viewer window slightly to see this output type.
-   Again, interact with the `scale` slider!
-Here, with `invert` True and output unnormalized, red color means high affinity (i.e., features at click point and rendered point are close to each other). Blue means low affinity. 
+- COLMAP (conda env: `ColmapLnx`)
+- Nerfstudio with GARField (conda env: `nerfstudio3`)
+- SAM 3 with fine-tuned checkpoint (conda env: `sam3`, on HPC)
+- Snakemake: `pip install snakemake pyyaml`
 
-https://github.com/chungmin99/garfield/assets/10284938/6edbdad6-d356-4b32-b44e-0df8ec1dca16
+### Run
 
-Also, note: the results can change a lot between 2k to 30k steps. 
+1. Place your drone images in `data/YOUR_PROJECT/images/`
+2. Edit `pipeline/config.yaml` with your dataset paths and parameters
+3. Run the full pipeline:
 
-Once the model is trained to completion, you can use the outputted config file for `garfield-gauss`.
-
-## Running GARField with Gaussian Splatting geometry!
-Although GARField's affinity field is optimized using NeRF geometry, it can be
-used to group and cluster gaussians in 3D!
-```
-ns-train garfield-gauss --data /your/data/here --pipeline.garfield-ckpt outputs/your/data/garfield/.../config.yml
+```bash
+snakemake -s pipeline/Snakefile --cores 4 all
 ```
 
-There are two main ways to interact with the scene -- make sure to pause training first!
-1. Interactive selection: click anywhere in the scene, and use "Crop to Click" button to retrieve different groups (scale=group level*0.05). Use "Drag Current Crop" to move it around!
+Or run individual stages:
 
+```bash
+snakemake -s pipeline/Snakefile --cores 4 colmap              # Stage 1: COLMAP only
+snakemake -s pipeline/Snakefile --cores 4 garfield_train       # Stage 2a: GARField training
+snakemake -s pipeline/Snakefile --cores 4 garfield_gauss_train # Stage 2b: Gaussian Splatting
+snakemake -s pipeline/Snakefile --cores 4 clustering           # Up to clustering (stages 1-4)
+snakemake -s pipeline/Snakefile --cores 4 sam3_inference        # SAM 3 on HPC (stage 6)
+snakemake -s pipeline/Snakefile --cores 4 semantic_labeling     # Final matching (stage 7)
+snakemake -s pipeline/Snakefile -n all                         # Dry run (show plan)
+```
 
-https://github.com/chungmin99/garfield/assets/10284938/82ea7145-d8d1-485d-bab2-f6e8b0ebd632
+## Repository Structure
 
+```
+garfield-semantic/
+├── README.md                              # This file
+├── pyproject.toml                         # Package config (from original GARField)
+│
+├── garfield/                              # GARField source code
+│   ├── garfield_config.py                 # GARField configuration
+│   ├── garfield_model.py                  # GARField model
+│   ├── garfield_field.py                  # GARField neural field
+│   ├── garfield_gaussian_pipeline.py      # MODIFIED: feature rendering support
+│   ├── garfield_pipeline.py               # GARField pipeline
+│   ├── garfield_datamanager.py            # Data loading
+│   ├── img_group_model.py                 # MODIFIED: SAM2 mask generation
+│   ├── garfield_ortho_projection.py       # NEW: orthographic feature projection
+│   ├── render_views_for_labeling.py       # NEW: render views for SAM 3
+│   ├── run_sam3_pcs.py                    # NEW: SAM 3 PCS inference
+│   ├── match_clusters_to_masks.py         # NEW: cluster matching (off-the-shelf)
+│   ├── match_clusters_to_masks_finetuned.py  # NEW: cluster matching (fine-tuned)
+│   ├── label_clusters_sam3.py             # NEW: end-to-end SAM 3 labeling
+│   └── label_clusters_nerf.py             # NEW: NeRF-based labeling
+│
+├── pipeline/                              # Pipeline orchestration
+│   ├── Snakefile                          # Snakemake pipeline definition
+│   ├── config.yaml                        # All paths and parameters
+│   └── scripts/
+│       └── run_pipeline.sh                # Bash script alternative
+│
+├── sam3_finetune/                          # SAM 3 fine-tuning on building facades
+│   ├── convert_hdb_to_coco.py             # HDB dataset conversion (VIA → COCO)
+│   ├── hdb_building_finetune.yaml         # SAM 3 training config
+│   └── README.md                          # Fine-tuning instructions
+│
+├── data/                                  # Input data (not tracked by git)
+│   └── YOUR_PROJECT/
+│       └── images/                        # Drone images
+│
+└── outputs/                               # Pipeline outputs (not tracked by git)
+    ├── YOUR_PROJECT/
+    │   ├── garfield/.../config.yml        # Stage 2a output
+    │   └── garfield-gauss/.../config.yml  # Stage 2b output
+    ├── ortho_projection/                  # Stage 3 output
+    ├── labeling_views/                    # Stage 5 output
+    ├── labeling_masks_finetuned/          # Stage 6 output
+    └── semantic_labels_finetuned/         # Stage 7 output
+        ├── semantic_pointcloud.ply        # Final labeled point cloud
+        ├── semantic_labels.json           # Per-cluster labels
+        └── per_label/                     # Individual PLY per class
+```
 
-2. Global clustering: cluster the currently visible gaussians (either globally or just for the crop), at the scale specified by "Cluster Scale".
+## SAM 3 Fine-Tuning
 
+We fine-tuned SAM 3 on the HDB building facade dataset (2,679 images, 11 classes) to improve building element detection. See `sam3_finetune/README.md` for details.
 
-https://github.com/chungmin99/garfield/assets/10284938/541fe037-925c-418f-929d-a9397f8d57d3
+**Results:**
+- AP@50: 34.6% on HDB validation set
+- Semantic labeling improved from 62% roof / 37% unknown (off-the-shelf) to 33% wall / 23% roof / 3% unknown (fine-tuned)
 
-
-   
 ## Citation
-If you use this work or find it helpful, please consider citing: (bibtex)
 
-```
-@inproceedings{garfield2024,
- author = {Kim, Chung Min* and Wu, Mingxuan* and Kerr, Justin* and Tancik, Matthew and Goldberg, Ken and Kanazawa, Angjoo},
- title = {GARField: Group Anything with Radiance Fields},
- booktitle = {arXiv},
- year = {2024},
+If you use this work, please cite:
+
+```bibtex
+@misc{garfield_semantic_2026,
+  title={Unsupervised Building Component Discovery via Orthographic Feature Projection from Neural Radiance Fields},
+  author={Ehsan Aghazadeh},
+  year={2026}
 }
 ```
+
+## Acknowledgments
+
+- [GARField](https://github.com/chungmin99/garfield) - Group Anything with Radiance Fields
+- [SAM 3](https://github.com/facebookresearch/sam3) - Segment Anything Model 3
+- [Nerfstudio](https://github.com/nerfstudio-project/nerfstudio) - NeRF framework
+- HDB Building Facade Dataset - University of Hong Kong

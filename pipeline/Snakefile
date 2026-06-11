@@ -1,0 +1,345 @@
+# ============================================================
+# Drone-to-BIM Semantic Segmentation Pipeline
+# ============================================================
+#
+# Two parallel branches:
+#   Branch A: GARField → Ortho Projection → Clustering
+#   Branch B: GARField-Gauss → Render Views → SAM 3 PCS
+#   Merge:    Cluster Matching → Semantic Point Cloud
+#
+# Usage:
+#   snakemake -s pipeline/Snakefile --cores 4 all
+#   snakemake -s pipeline/Snakefile --cores 4 colmap
+#   snakemake -s pipeline/Snakefile --cores 4 clustering
+#   snakemake -s pipeline/Snakefile --cores 4 semantic_labeling
+#   snakemake -s pipeline/Snakefile -n all              # Dry run
+#   snakemake -s pipeline/Snakefile --cores 4 clean     # Clean outputs
+#
+# ============================================================
+
+import yaml
+import glob
+import os
+
+# Load config
+with open("pipeline/config.yaml") as f:
+    cfg = yaml.safe_load(f)
+
+DATASET_PATH = cfg["dataset"]["path"]
+DATASET_NAME = cfg["dataset"]["name"]
+HAS_GPS = cfg["dataset"]["has_gps"]
+
+PROJECTION_SCALE = cfg["projection"]["scale"]
+PROJECTION_OUTPUT = cfg["projection"]["output_dir"]
+PC_PATH = cfg["projection"]["pointcloud"]
+
+VIEWS_DIR = cfg["labeling_views"]["output_dir"]
+MASKS_DIR = "outputs/labeling_masks_finetuned"
+FEATURES_DIR = cfg["matching"]["features_dir"]
+LABELS_NPY = cfg["matching"]["labels_npy"]
+SEMANTIC_OUTPUT = cfg["matching"]["output_dir"]
+
+# Conda environments
+ENV_COLMAP = cfg["colmap"]["conda_env"]
+ENV_NERFSTUDIO = cfg["garfield"]["conda_env"]
+
+# HPC config
+HPC_USER = cfg["hpc"]["user"]
+HPC_HOST = cfg["hpc"]["host"]
+HPC_WORK = cfg["hpc"]["work_dir"]
+HPC_ACCOUNT = cfg["hpc"]["account"]
+HPC_PARTITION = cfg["hpc"]["partition"]
+HF_TOKEN = cfg["hpc"]["hf_token"]
+
+# ============================================================
+# Helper: auto-detect latest nerfstudio config
+# ============================================================
+
+def find_latest_config(model_type):
+    """Find the latest config.yml for a given model type (garfield or garfield-gauss)."""
+    pattern = f"outputs/*/{model_type}/*/config.yml"
+    configs = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+    if configs:
+        return configs[0]
+    return None
+
+# ============================================================
+# Target rules
+# ============================================================
+
+rule all:
+    input:
+        f"{SEMANTIC_OUTPUT}/semantic_pointcloud.ply"
+
+# ============================================================
+# Stage 1: COLMAP - Structure from Motion
+# ============================================================
+
+rule colmap_feature_extract:
+    input:
+        images = f"{DATASET_PATH}/images"
+    output:
+        db = f"{DATASET_PATH}/database.db"
+    shell:
+        """
+        conda run -n {ENV_COLMAP} \
+            colmap feature_extractor \
+                --database_path {output.db} \
+                --image_path {input.images}
+        """
+
+rule colmap_matching:
+    input:
+        db = f"{DATASET_PATH}/database.db"
+    output:
+        done = touch(f"{DATASET_PATH}/.matching_done")
+    run:
+        if HAS_GPS:
+            shell("conda run -n {ENV_COLMAP} colmap spatial_matcher --database_path {input.db}")
+        else:
+            shell("conda run -n {ENV_COLMAP} colmap sequential_matcher --database_path {input.db}")
+
+rule colmap_mapper:
+    input:
+        db = f"{DATASET_PATH}/database.db",
+        done = f"{DATASET_PATH}/.matching_done",
+        images = f"{DATASET_PATH}/images"
+    output:
+        sparse = directory(f"{DATASET_PATH}/sparse/0")
+    shell:
+        """
+        conda run -n {ENV_COLMAP} \
+            colmap mapper \
+                --database_path {input.db} \
+                --image_path {input.images} \
+                --output_path {DATASET_PATH}
+
+        mkdir -p {DATASET_PATH}/sparse
+        [ -d "{DATASET_PATH}/0" ] && mv {DATASET_PATH}/0 {DATASET_PATH}/sparse/ || true
+        [ -d "{DATASET_PATH}/1" ] && mv {DATASET_PATH}/1 {DATASET_PATH}/sparse/ || true
+        """
+
+rule colmap:
+    input:
+        f"{DATASET_PATH}/sparse/0"
+
+# ============================================================
+# Stage 2a: GARField (NeRF) Training
+#   → Provides 256-dim grouping features for projection
+# ============================================================
+
+rule garfield_train:
+    input:
+        sparse = f"{DATASET_PATH}/sparse/0"
+    output:
+        done = touch("outputs/.garfield_train_done")
+    shell:
+        """
+        echo "============================================"
+        echo "  Stage 2a: GARField (NeRF) Training"
+        echo "  This will take several hours."
+        echo "============================================"
+
+        conda run -n {ENV_NERFSTUDIO} \
+            ns-train garfield colmap \
+                --data data/{DATASET_NAME} \
+                --colmap-path sparse/0/
+
+        echo ""
+        echo "GARField training complete."
+        echo "Config auto-detected at: $(ls -t outputs/*/garfield/*/config.yml | head -1)"
+        """
+
+# ============================================================
+# Stage 2b: GARField-Gauss (Gaussian Splatting) Training
+#   → Provides clean RGB rendering for SAM 3 labeling views
+# ============================================================
+
+rule garfield_gauss_train:
+    input:
+        sparse = f"{DATASET_PATH}/sparse/0"
+    output:
+        done = touch("outputs/.garfield_gauss_train_done")
+    shell:
+        """
+        echo "============================================"
+        echo "  Stage 2b: GARField-Gauss Training"
+        echo "  This will take several hours."
+        echo "============================================"
+
+        conda run -n {ENV_NERFSTUDIO} \
+            ns-train garfield-gauss colmap \
+                --data data/{DATASET_NAME} \
+                --colmap-path sparse/0/
+
+        echo ""
+        echo "GARField-Gauss training complete."
+        echo "Config auto-detected at: $(ls -t outputs/*/garfield-gauss/*/config.yml | head -1)"
+        """
+
+# ============================================================
+# Stage 3: Orthographic Feature Projection (uses GARField)
+# ============================================================
+
+rule ortho_projection:
+    input:
+        garfield_done = "outputs/.garfield_train_done",
+        pc = PC_PATH
+    output:
+        features = f"{PROJECTION_OUTPUT}/avg_features.npy",
+        points = f"{PROJECTION_OUTPUT}/points.npy"
+    shell:
+        """
+        GARFIELD_CONFIG=$(ls -t outputs/*/garfield/*/config.yml | head -1)
+        echo "Using GARField config: $GARFIELD_CONFIG"
+
+        conda run -n {ENV_NERFSTUDIO} \
+            python garfield/garfield_ortho_projection.py \
+                --config $GARFIELD_CONFIG \
+                --pointcloud {input.pc} \
+                --scale {PROJECTION_SCALE} \
+                --output-dir {PROJECTION_OUTPUT}
+        """
+
+# ============================================================
+# Stage 4: HDBSCAN Clustering
+# ============================================================
+
+rule clustering:
+    input:
+        features = f"{PROJECTION_OUTPUT}/avg_features.npy",
+        points = f"{PROJECTION_OUTPUT}/points.npy"
+    output:
+        labels = f"{FEATURES_DIR}/cluster_labels.npy"
+    shell:
+        """
+        conda run -n {ENV_NERFSTUDIO} \
+            python garfield/cluster_sweep.py \
+                --features-dir {PROJECTION_OUTPUT}
+        """
+
+# ============================================================
+# Stage 5: Render Labeling Views (uses GARField-Gauss)
+# ============================================================
+
+rule render_views:
+    input:
+        gauss_done = "outputs/.garfield_gauss_train_done"
+    output:
+        params = f"{VIEWS_DIR}/view_params.json"
+    shell:
+        """
+        GAUSS_CONFIG=$(ls -t outputs/*/garfield-gauss/*/config.yml | head -1)
+        echo "Using GARField-Gauss config: $GAUSS_CONFIG"
+
+        conda run -n {ENV_NERFSTUDIO} \
+            python garfield/render_views_for_labeling.py \
+                --config $GAUSS_CONFIG \
+                --output-dir {VIEWS_DIR}
+        """
+
+# ============================================================
+# Stage 6: SAM 3 PCS Inference (on HPC)
+# ============================================================
+
+rule sam3_inference:
+    input:
+        views = f"{VIEWS_DIR}/view_params.json"
+    output:
+        done = touch("outputs/.sam3_inference_done")
+    shell:
+        """
+        echo "============================================"
+        echo "  Stage 6: SAM 3 Inference on HPC"
+        echo "  Enter HPC password when prompted"
+        echo "============================================"
+
+        # Open persistent SSH connection (password asked once)
+        ssh -M -S /tmp/hpc-snake -fN {HPC_USER}@{HPC_HOST}
+
+        # Upload views to HPC
+        echo "Uploading views to HPC..."
+        scp -o ControlPath=/tmp/hpc-snake -r \
+            {VIEWS_DIR} {HPC_USER}@{HPC_HOST}:{HPC_WORK}/labeling_views
+
+        # Upload inference script
+        scp -o ControlPath=/tmp/hpc-snake \
+            garfield/run_sam3_finetuned_pcs.py \
+            {HPC_USER}@{HPC_HOST}:{HPC_WORK}/
+
+        # Run SAM 3 on HPC
+        echo "Running SAM 3 inference on HPC..."
+        ssh -S /tmp/hpc-snake {HPC_USER}@{HPC_HOST} bash -c '
+            source activate {HPC_WORK}/conda_envs/sam3
+            export HF_TOKEN="{HF_TOKEN}"
+            export HF_HOME={HPC_WORK}/.cache/huggingface
+            cd {HPC_WORK}/sam3_repo
+            salloc -t 01:00:00 -N1 -n32 --gres=gpu:1 -p {HPC_PARTITION} -A {HPC_ACCOUNT} \
+                python {HPC_WORK}/run_sam3_finetuned_pcs.py
+        '
+
+        # Download results
+        echo "Downloading masks from HPC..."
+        mkdir -p {MASKS_DIR}
+        scp -o ControlPath=/tmp/hpc-snake -r \
+            {HPC_USER}@{HPC_HOST}:{HPC_WORK}/labeling_masks_finetuned/* \
+            {MASKS_DIR}/
+
+        # Close SSH connection
+        ssh -S /tmp/hpc-snake -O exit {HPC_USER}@{HPC_HOST} 2>/dev/null || true
+
+        echo "SAM 3 inference complete."
+        """
+
+# ============================================================
+# Stage 7: Cluster-to-Mask Matching
+# ============================================================
+
+rule semantic_labeling:
+    input:
+        labels = f"{FEATURES_DIR}/cluster_labels.npy",
+        views = f"{VIEWS_DIR}/view_params.json",
+        masks_done = "outputs/.sam3_inference_done"
+    output:
+        ply = f"{SEMANTIC_OUTPUT}/semantic_pointcloud.ply",
+        json = f"{SEMANTIC_OUTPUT}/semantic_labels.json"
+    shell:
+        """
+        conda run -n {ENV_NERFSTUDIO} \
+            python garfield/match_clusters_to_masks_finetuned.py \
+                --features-dir {FEATURES_DIR} \
+                --labels-npy {LABELS_NPY} \
+                --views-dir {VIEWS_DIR} \
+                --masks-dir {MASKS_DIR} \
+                --output-dir {SEMANTIC_OUTPUT}
+        """
+
+# ============================================================
+# Utility rules
+# ============================================================
+
+rule clean:
+    shell:
+        """
+        rm -f {DATASET_PATH}/database.db
+        rm -f {DATASET_PATH}/.matching_done
+        rm -f outputs/.garfield_train_done
+        rm -f outputs/.garfield_gauss_train_done
+        rm -f outputs/.sam3_inference_done
+        echo "Cleaned marker files."
+        """
+
+rule clean_all:
+    shell:
+        """
+        rm -rf {PROJECTION_OUTPUT}
+        rm -rf {VIEWS_DIR}
+        rm -rf {MASKS_DIR}
+        rm -rf {SEMANTIC_OUTPUT}
+        rm -f {DATASET_PATH}/database.db
+        rm -f {DATASET_PATH}/.matching_done
+        rm -f outputs/.garfield_train_done
+        rm -f outputs/.garfield_gauss_train_done
+        rm -f outputs/.sam3_inference_done
+        echo "Cleaned all outputs."
+        """
