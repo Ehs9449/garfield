@@ -82,8 +82,7 @@ rule colmap_feature_extract:
         db = f"{DATASET_PATH}/database.db"
     shell:
         """
-        conda run -n {ENV_COLMAP} \
-            colmap feature_extractor \
+        set +u; source activate {ENV_COLMAP}; set -u; colmap feature_extractor \
                 --database_path {output.db} \
                 --image_path {input.images}
         """
@@ -95,9 +94,9 @@ rule colmap_matching:
         done = touch(f"{DATASET_PATH}/.matching_done")
     run:
         if HAS_GPS:
-            shell("conda run -n {ENV_COLMAP} colmap spatial_matcher --database_path {input.db}")
+            shell("set +u; source activate {ENV_COLMAP}; set -u; colmap spatial_matcher --database_path {input.db}")
         else:
-            shell("conda run -n {ENV_COLMAP} colmap sequential_matcher --database_path {input.db}")
+            shell("set +u; source activate {ENV_COLMAP}; set -u; colmap sequential_matcher --database_path {input.db}")
 
 rule colmap_mapper:
     input:
@@ -108,8 +107,7 @@ rule colmap_mapper:
         sparse = directory(f"{DATASET_PATH}/sparse/0")
     shell:
         """
-        conda run -n {ENV_COLMAP} \
-            colmap mapper \
+        set +u; source activate {ENV_COLMAP}; set -u; colmap mapper \
                 --database_path {input.db} \
                 --image_path {input.images} \
                 --output_path {DATASET_PATH}
@@ -140,8 +138,7 @@ rule garfield_train:
         echo "  This will take several hours."
         echo "============================================"
 
-        conda run -n {ENV_NERFSTUDIO} \
-            ns-train garfield colmap \
+        set +u; source activate {ENV_NERFSTUDIO}; set -u; ns-train garfield colmap \
                 --data data/{DATASET_NAME} \
                 --colmap-path sparse/0/
 
@@ -157,7 +154,8 @@ rule garfield_train:
 
 rule garfield_gauss_train:
     input:
-        sparse = f"{DATASET_PATH}/sparse/0"
+        sparse = f"{DATASET_PATH}/sparse/0",
+        garfield_done = "outputs/.garfield_train_done"
     output:
         done = touch("outputs/.garfield_gauss_train_done")
     shell:
@@ -167,10 +165,13 @@ rule garfield_gauss_train:
         echo "  This will take several hours."
         echo "============================================"
 
-        conda run -n {ENV_NERFSTUDIO} \
-            ns-train garfield-gauss colmap \
+        GARFIELD_CKPT=$(ls -t outputs/*/garfield/*/nerfstudio_models/*.ckpt 2>/dev/null | head -1)
+        echo "Using GARField checkpoint: $GARFIELD_CKPT"
+
+        set +u; source activate {ENV_NERFSTUDIO}; set -u; ns-train garfield-gauss colmap \
                 --data data/{DATASET_NAME} \
-                --colmap-path sparse/0/
+                --colmap-path sparse/0/ \
+                --pipeline.garfield_ckpt $GARFIELD_CKPT
 
         echo ""
         echo "GARField-Gauss training complete."
@@ -193,8 +194,7 @@ rule ortho_projection:
         GARFIELD_CONFIG=$(ls -t outputs/*/garfield/*/config.yml | head -1)
         echo "Using GARField config: $GARFIELD_CONFIG"
 
-        conda run -n {ENV_NERFSTUDIO} \
-            python garfield/garfield_ortho_projection.py \
+        set +u; source activate {ENV_NERFSTUDIO}; set -u; python garfield/garfield_ortho_projection.py \
                 --config $GARFIELD_CONFIG \
                 --pointcloud {input.pc} \
                 --scale {PROJECTION_SCALE} \
@@ -213,8 +213,7 @@ rule clustering:
         labels = f"{FEATURES_DIR}/cluster_labels.npy"
     shell:
         """
-        conda run -n {ENV_NERFSTUDIO} \
-            python garfield/cluster_sweep.py \
+        set +u; source activate {ENV_NERFSTUDIO}; set -u; python garfield/cluster_sweep.py \
                 --features-dir {PROJECTION_OUTPUT}
         """
 
@@ -232,8 +231,7 @@ rule render_views:
         GAUSS_CONFIG=$(ls -t outputs/*/garfield-gauss/*/config.yml | head -1)
         echo "Using GARField-Gauss config: $GAUSS_CONFIG"
 
-        conda run -n {ENV_NERFSTUDIO} \
-            python garfield/render_views_for_labeling.py \
+        set +u; source activate {ENV_NERFSTUDIO}; set -u; python garfield/render_views_for_labeling.py \
                 --config $GAUSS_CONFIG \
                 --output-dir {VIEWS_DIR}
         """
@@ -270,7 +268,7 @@ rule sam3_inference:
         # Run SAM 3 on HPC
         echo "Running SAM 3 inference on HPC..."
         ssh -S /tmp/hpc-snake {HPC_USER}@{HPC_HOST} bash -c '
-            source activate {HPC_WORK}/conda_envs/sam3
+            set +u; source activate {HPC_WORK}/conda_envs/sam3; set -u
             export HF_TOKEN="{HF_TOKEN}"
             export HF_HOME={HPC_WORK}/.cache/huggingface
             cd {HPC_WORK}/sam3_repo
@@ -305,8 +303,7 @@ rule semantic_labeling:
         json = f"{SEMANTIC_OUTPUT}/semantic_labels.json"
     shell:
         """
-        conda run -n {ENV_NERFSTUDIO} \
-            python garfield/match_clusters_to_masks_finetuned.py \
+        set +u; source activate {ENV_NERFSTUDIO}; set -u; python garfield/match_clusters_to_masks_finetuned.py \
                 --features-dir {FEATURES_DIR} \
                 --labels-npy {LABELS_NPY} \
                 --views-dir {VIEWS_DIR} \
