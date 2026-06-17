@@ -67,7 +67,7 @@ def main():
     # Load model
     print("Loading Gaussian Splatting model...")
     original_cwd = os.getcwd()
-    os.chdir("/home/eaghae1")
+    os.chdir(Path(__file__).resolve().parents[1])
 
     config, pipeline, checkpoint_path, step = eval_setup(args.config, test_mode='test')
     pipeline.eval()

@@ -39,6 +39,17 @@ FEATURES_DIR = cfg["matching"]["features_dir"]
 LABELS_NPY = cfg["matching"]["labels_npy"]
 SEMANTIC_OUTPUT = cfg["matching"]["output_dir"]
 
+GARFIELD_CONFIG_TXT = f"outputs/{DATASET_NAME}/garfield_config.txt"
+GAUSS_CONFIG_TXT = f"outputs/{DATASET_NAME}/garfield_gauss_config.txt"
+
+GARFIELD_DONE = f"outputs/{DATASET_NAME}/.garfield_train_done"
+GAUSS_DONE = f"outputs/{DATASET_NAME}/.garfield_gauss_train_done"
+SAM3_DONE = f"outputs/{DATASET_NAME}/.sam3_inference_done"
+
+GARFIELD_DONE = f"outputs/{DATASET_NAME}/.garfield_train_done"
+GAUSS_DONE = f"outputs/{DATASET_NAME}/.garfield_gauss_train_done"
+SAM3_DONE = f"outputs/{DATASET_NAME}/.sam3_inference_done"
+
 # Conda environments
 ENV_COLMAP = cfg["colmap"]["conda_env"]
 ENV_NERFSTUDIO = cfg["garfield"]["conda_env"]
@@ -89,7 +100,7 @@ rule colmap_feature_extract:
 
 rule colmap_matching:
     input:
-        db = f"{DATASET_PATH}/database.db"
+        db = ancient(f"{DATASET_PATH}/database.db")
     output:
         done = touch(f"{DATASET_PATH}/.matching_done")
     run:
@@ -130,7 +141,8 @@ rule garfield_train:
     input:
         sparse = f"{DATASET_PATH}/sparse/0"
     output:
-        done = touch("outputs/.garfield_train_done")
+        done = touch(GARFIELD_DONE),
+        config_txt = GARFIELD_CONFIG_TXT
     shell:
         """
         echo "============================================"
@@ -138,13 +150,18 @@ rule garfield_train:
         echo "  This will take several hours."
         echo "============================================"
 
-        set +u; source activate {ENV_NERFSTUDIO}; set -u; ns-train garfield colmap \
+        set +u; source activate {ENV_NERFSTUDIO}; set -u; ns-train garfield --viewer.quit-on-train-completion True colmap \
                 --data data/{DATASET_NAME} \
                 --colmap-path sparse/0/
 
+        GARFIELD_CONFIG=$(realpath $(find outputs -path "*/garfield/*/config.yml" -type f -printf "%T@ %p\n" | sort -nr | head -1 | cut -d" " -f2-))
+        test -f "$GARFIELD_CONFIG"
+        mkdir -p outputs/{DATASET_NAME}
+        echo "$GARFIELD_CONFIG" > {output.config_txt}
+
         echo ""
         echo "GARField training complete."
-        echo "Config auto-detected at: $(ls -t outputs/*/garfield/*/config.yml | head -1)"
+        echo "Config saved to: $GARFIELD_CONFIG"
         """
 
 # ============================================================
@@ -155,9 +172,11 @@ rule garfield_train:
 rule garfield_gauss_train:
     input:
         sparse = f"{DATASET_PATH}/sparse/0",
-        garfield_done = "outputs/.garfield_train_done"
+        garfield_done = GARFIELD_DONE,
+        garfield_config_txt = GARFIELD_CONFIG_TXT
     output:
-        done = touch("outputs/.garfield_gauss_train_done")
+        done = touch(GAUSS_DONE),
+        config_txt = GAUSS_CONFIG_TXT
     shell:
         """
         echo "============================================"
@@ -165,35 +184,73 @@ rule garfield_gauss_train:
         echo "  This will take several hours."
         echo "============================================"
 
-        GARFIELD_CKPT=$(ls -t outputs/*/garfield/*/nerfstudio_models/*.ckpt 2>/dev/null | head -1)
-        echo "Using GARField checkpoint: $GARFIELD_CKPT"
-
-        set +u; source activate {ENV_NERFSTUDIO}; set -u; ns-train garfield-gauss colmap \
+        GARFIELD_CONFIG=$(cat {input.garfield_config_txt})
+        test -f "$GARFIELD_CONFIG"
+        set +u; source activate {ENV_NERFSTUDIO}; set -u; ns-train garfield-gauss \
+                --pipeline.garfield-ckpt $GARFIELD_CONFIG \
+                --viewer.quit-on-train-completion True \
                 --data data/{DATASET_NAME} \
-                --colmap-path sparse/0/ \
-                --pipeline.garfield_ckpt $GARFIELD_CKPT
+                --pipeline.datamanager.camera-res-scale-factor 0.25 \
+                --pipeline.datamanager.cache-images cpu
+
+        GAUSS_CONFIG=$(realpath $(find outputs -path "*/garfield-gauss/*/config.yml" -type f -printf "%T@ %p\n" | sort -nr | head -1 | cut -d" " -f2-))
+        test -f "$GAUSS_CONFIG"
+        mkdir -p outputs/{DATASET_NAME}
+        echo "$GAUSS_CONFIG" > {output.config_txt}
 
         echo ""
         echo "GARField-Gauss training complete."
-        echo "Config auto-detected at: $(ls -t outputs/*/garfield-gauss/*/config.yml | head -1)"
+        echo "Config saved to: $GAUSS_CONFIG"
         """
 
 # ============================================================
 # Stage 3: Orthographic Feature Projection (uses GARField)
 # ============================================================
 
+rule export_garfield_pointcloud:
+    input:
+        garfield_done = GARFIELD_DONE,
+        garfield_config_txt = GARFIELD_CONFIG_TXT
+
+    output:
+        pc = PC_PATH
+
+    shell:
+        """
+        GARFIELD_CONFIG=$(cat {input.garfield_config_txt})
+        test -f "$GARFIELD_CONFIG"
+
+        echo "============================================"
+        echo " Exporting GARField Point Cloud"
+        echo "============================================"
+        echo "Using config: $GARFIELD_CONFIG"
+
+        set +u; source activate nerfstudio3; set -u; ns-export pointcloud \
+            --load-config "$GARFIELD_CONFIG" \
+            --output-dir $(dirname {output.pc}) \
+            --num-points 1000000 \
+            --remove-outliers True \
+            --normal-method open3d \
+            --save-world-frame False
+
+        test -f {output.pc}
+        """
+
 rule ortho_projection:
     input:
-        garfield_done = "outputs/.garfield_train_done",
+        garfield_done = GARFIELD_DONE,
+        garfield_config_txt = GARFIELD_CONFIG_TXT,
         pc = PC_PATH
     output:
         features = f"{PROJECTION_OUTPUT}/avg_features.npy",
         points = f"{PROJECTION_OUTPUT}/points.npy"
     shell:
         """
-        GARFIELD_CONFIG=$(ls -t outputs/*/garfield/*/config.yml | head -1)
+        GARFIELD_CONFIG=$(cat {input.garfield_config_txt})
+        test -f "$GARFIELD_CONFIG"
         echo "Using GARField config: $GARFIELD_CONFIG"
 
+        cd /home/eaghae1/garfield-semantic
         set +u; source activate {ENV_NERFSTUDIO}; set -u; python garfield/garfield_ortho_projection.py \
                 --config $GARFIELD_CONFIG \
                 --pointcloud {input.pc} \
@@ -223,12 +280,14 @@ rule clustering:
 
 rule render_views:
     input:
-        gauss_done = "outputs/.garfield_gauss_train_done"
+        gauss_done = GAUSS_DONE,
+        gauss_config_txt = GAUSS_CONFIG_TXT
     output:
         params = f"{VIEWS_DIR}/view_params.json"
     shell:
         """
-        GAUSS_CONFIG=$(ls -t outputs/*/garfield-gauss/*/config.yml | head -1)
+        GAUSS_CONFIG=$(cat {input.gauss_config_txt})
+        test -f "$GAUSS_CONFIG"
         echo "Using GARField-Gauss config: $GAUSS_CONFIG"
 
         set +u; source activate {ENV_NERFSTUDIO}; set -u; python garfield/render_views_for_labeling.py \
@@ -244,7 +303,7 @@ rule sam3_inference:
     input:
         views = f"{VIEWS_DIR}/view_params.json"
     output:
-        done = touch("outputs/.sam3_inference_done")
+        done = touch(SAM3_DONE)
     shell:
         """
         echo "============================================"
@@ -260,10 +319,8 @@ rule sam3_inference:
         scp -o ControlPath=/tmp/hpc-snake -r \
             {VIEWS_DIR} {HPC_USER}@{HPC_HOST}:{HPC_WORK}/labeling_views
 
-        # Upload inference script
-        scp -o ControlPath=/tmp/hpc-snake \
-            garfield/run_sam3_finetuned_pcs.py \
-            {HPC_USER}@{HPC_HOST}:{HPC_WORK}/
+        # SAM3 inference script is already stored on HPC at:
+        # {HPC_WORK}/run_sam3_finetuned_pcs.py
 
         # Run SAM 3 on HPC
         echo "Running SAM 3 inference on HPC..."
@@ -272,7 +329,7 @@ rule sam3_inference:
             export HF_TOKEN="{HF_TOKEN}"
             export HF_HOME={HPC_WORK}/.cache/huggingface
             cd {HPC_WORK}/sam3_repo
-            salloc -t 01:00:00 -N1 -n32 --gres=gpu:1 -p {HPC_PARTITION} -A {HPC_ACCOUNT} \
+            srun -t 02:00:00 -N1 -n1 --cpus-per-task=64 --gres=gpu:1 -p {HPC_PARTITION} -A {HPC_ACCOUNT} \
                 python {HPC_WORK}/run_sam3_finetuned_pcs.py
         '
 
@@ -297,7 +354,7 @@ rule semantic_labeling:
     input:
         labels = f"{FEATURES_DIR}/cluster_labels.npy",
         views = f"{VIEWS_DIR}/view_params.json",
-        masks_done = "outputs/.sam3_inference_done"
+        masks_done = SAM3_DONE
     output:
         ply = f"{SEMANTIC_OUTPUT}/semantic_pointcloud.ply",
         json = f"{SEMANTIC_OUTPUT}/semantic_labels.json"
