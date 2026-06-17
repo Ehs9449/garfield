@@ -167,7 +167,7 @@ def main():
         json.dump(all_view_params, f, indent=2)
 
     print(f"\n✓ Saved {len(views)} images + view_params.json to {output_dir}")
-    print("Next: conda activate sam3 && python run_sam3_pcs.py")
+    print("Next: run Snakemake rule sam3_inference to execute run_sam3_finetuned_pcs.py on HPC")
 
 
 if __name__ == "__main__":

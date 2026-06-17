@@ -13,3 +13,21 @@ __pycache__/
 .DS_Store
 Downloads/
 .snakemake/
+
+# Pipeline generated outputs
+outputs/
+exports/
+data/
+.snakemake/
+
+# Large model/data files
+*.ckpt
+*.ply
+*.npy
+*.npz
+*.db
+*.bin
+
+# Backups/logs
+*.bak*
+*.log

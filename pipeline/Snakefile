@@ -271,7 +271,8 @@ rule clustering:
     shell:
         """
         set +u; source activate {ENV_NERFSTUDIO}; set -u; python garfield/cluster_sweep.py \
-                --features-dir {PROJECTION_OUTPUT}
+                --input-dir {PROJECTION_OUTPUT} \
+                --output-dir {FEATURES_DIR}
         """
 
 # ============================================================
