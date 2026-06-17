@@ -120,6 +120,22 @@ python sam3/train/train.py -c configs/hdb_building_finetune --use-cluster 1
 
 Training takes ~6.5 hours on 4 A100 GPUs.
 
+## Resolved Training Configuration
+
+The exact configuration used for training is saved as `config_resolved.yaml` (the fully-resolved Hydra config, with all template values expanded). This is the authoritative record of how the model was trained and is preferred over the template for reproducibility.
+
+Key settings captured in the resolved config:
+
+- **Schedule:** 30 epochs (`max_epochs: 30`, `max_data_epochs: 30`), `target_epoch_size: 2679` (full training set), single node, 4 GPUs.
+- **Differentiated learning rates by component:** transformer 8e-5, vision backbone 2.5e-5, language backbone 5e-6, with layer decay 0.9 applied to the vision trunk (`pos_embed` overridden to 1.0).
+- **Optimizer:** AdamW with bfloat16 AMP, gradient clipping (max_norm 0.1), inverse square-root LR scheduler (warmup 20, cooldown 20, timescale 20), weight decay 0.1 (0.0 for bias and LayerNorm).
+- **Segmentation enabled** (`enable_segmentation: true`) with the Masks loss active: `loss_mask: 200.0`, `loss_dice: 10.0`, focal alpha 0.25 / gamma 2.0. Detection losses: `loss_bbox: 5.0`, `loss_giou: 2.0`, `loss_ce: 20.0`, `presence_loss: 20.0`.
+- **DDP fix:** `static_graph: true` and `find_unused_parameters: true` under the distributed config — required because the segmentation head has parameters not used on every forward pass.
+- **Input resolution:** 1008×1008, square padding, random resize (min 480), normalization mean/std 0.5.
+- **Checkpoints** every 5 epochs to `/work/eaghae1/sam3_finetune_hdb/checkpoints`.
+
+Note: the resolved config shows `device: cpus` under the model builder — this is only the build-time placeholder; training ran on CUDA per the trainer's `accelerator: cuda` setting.
+
 ## Results
 
 | Epoch | AP@50  | AP@50:95 | AR@100 |
