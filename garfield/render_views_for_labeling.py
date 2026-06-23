@@ -20,6 +20,7 @@ from pathlib import Path
 import argparse
 import os
 import json
+import yaml
 import cv2
 
 from nerfstudio.utils.eval_utils import eval_setup
@@ -59,10 +60,27 @@ def main():
     parser.add_argument("--config", type=Path,
                         default=Path("/home/eaghae1/outputs/PFTdrone/garfield-gauss/2026-05-03_101858/config.yml"))
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/labeling_views"))
+    parser.add_argument("--config-yaml", type=Path, default=Path("pipeline/config.yaml"),
+                        help="Pipeline config YAML containing labeling_views settings")
     args = parser.parse_args()
+
+    with open(args.config_yaml, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    n_low = int(cfg["labeling_views"]["n_azimuth_low"])
+    n_mid = int(cfg["labeling_views"]["n_azimuth_mid"])
+    n_top = int(cfg["labeling_views"]["n_top"])
 
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Clean old rendered views so experiments with different view counts
+    # do not mix old and new images.
+    for old_file in list(output_dir.glob("view_*.jpg")) + list(output_dir.glob("view_*.png")):
+        old_file.unlink()
+    old_params = output_dir / "view_params.json"
+    if old_params.exists():
+        old_params.unlink()
 
     # Load model
     print("Loading Gaussian Splatting model...")
@@ -97,14 +115,19 @@ def main():
     building_radius = 0.7
 
     views = []
-    # Facade views every 30 degrees
-    for az in range(0, 360, 30):
-        views.append({'azimuth': az, 'elevation': 15, 'type': 'facade'})
-    # Elevated views every 45 degrees
-    for az in range(0, 360, 45):
-        views.append({'azimuth': az, 'elevation': 45, 'type': 'elevated'})
-    # Top-down
-    views.append({'azimuth': 0, 'elevation': 85, 'type': 'top'})
+
+    # Low-elevation facade views
+    for az in np.linspace(0, 360, n_low, endpoint=False):
+        views.append({'azimuth': int(round(az)), 'elevation': 15, 'type': 'facade'})
+
+    # Mid-elevation views
+    for az in np.linspace(0, 360, n_mid, endpoint=False):
+        views.append({'azimuth': int(round(az)), 'elevation': 45, 'type': 'elevated'})
+
+    # Top-down views
+    for i in range(n_top):
+        az = 0 if n_top == 1 else int(round(i * 360 / n_top))
+        views.append({'azimuth': az, 'elevation': 85, 'type': 'top'})
 
     print(f"Rendering {len(views)} views...")
 

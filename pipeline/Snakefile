@@ -282,7 +282,8 @@ rule clustering:
 rule render_views:
     input:
         gauss_done = GAUSS_DONE,
-        gauss_config_txt = GAUSS_CONFIG_TXT
+        gauss_config_txt = GAUSS_CONFIG_TXT,
+        pipeline_cfg = "pipeline/config.yaml"
     output:
         params = f"{VIEWS_DIR}/view_params.json"
     shell:
