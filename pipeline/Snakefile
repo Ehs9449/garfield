@@ -331,10 +331,14 @@ rule sam3_inference:
         # Open persistent SSH connection (password asked once)
         ssh -M -S /tmp/hpc-snake -fN {HPC_USER}@{HPC_HOST}
 
+        # Clean old views on HPC so previous experiments do not mix with the current run
+        ssh -S /tmp/hpc-snake {HPC_USER}@{HPC_HOST} \
+            "rm -rf {HPC_WORK}/labeling_views && mkdir -p {HPC_WORK}/labeling_views"
+
         # Upload views to HPC
         echo "Uploading views to HPC..."
         scp -o ControlPath=/tmp/hpc-snake -r \
-            {VIEWS_DIR} {HPC_USER}@{HPC_HOST}:{HPC_WORK}/labeling_views
+            {VIEWS_DIR}/* {HPC_USER}@{HPC_HOST}:{HPC_WORK}/labeling_views/
 
         # Upload pipeline config to HPC
         scp -o ControlPath=/tmp/hpc-snake pipeline/config.yaml \
