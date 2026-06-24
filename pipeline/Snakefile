@@ -22,7 +22,8 @@ import glob
 import os
 
 # Load config
-with open("pipeline/config.yaml") as f:
+CONFIG_FILE = "pipeline/config.yaml"
+with open(CONFIG_FILE) as f:
     cfg = yaml.safe_load(f)
 
 DATASET_PATH = cfg["dataset"]["path"]
@@ -34,6 +35,9 @@ PROJECTION_OUTPUT = cfg["projection"]["output_dir"]
 PC_PATH = cfg["projection"]["pointcloud"]
 
 VIEWS_DIR = cfg["labeling_views"]["output_dir"]
+
+CLUSTER_N_TRIALS = cfg["clustering"].get("n_trials", 40)
+CLUSTER_SAMPLE_SIZE = cfg["clustering"].get("sample_size", 50000)
 MASKS_DIR = "outputs/labeling_masks_finetuned"
 FEATURES_DIR = cfg["matching"]["features_dir"]
 LABELS_NPY = cfg["matching"]["labels_npy"]
@@ -240,7 +244,8 @@ rule ortho_projection:
     input:
         garfield_done = GARFIELD_DONE,
         garfield_config_txt = GARFIELD_CONFIG_TXT,
-        pc = PC_PATH
+        pc = PC_PATH,
+        pipeline_cfg = CONFIG_FILE
     output:
         features = f"{PROJECTION_OUTPUT}/avg_features.npy",
         points = f"{PROJECTION_OUTPUT}/points.npy"
@@ -265,14 +270,17 @@ rule ortho_projection:
 rule clustering:
     input:
         features = f"{PROJECTION_OUTPUT}/avg_features.npy",
-        points = f"{PROJECTION_OUTPUT}/points.npy"
+        points = f"{PROJECTION_OUTPUT}/points.npy",
+        pipeline_cfg = CONFIG_FILE
     output:
         labels = f"{FEATURES_DIR}/cluster_labels.npy"
     shell:
         """
         set +u; source activate {ENV_NERFSTUDIO}; set -u; python garfield/cluster_sweep.py \
                 --input-dir {PROJECTION_OUTPUT} \
-                --output-dir {FEATURES_DIR}
+                --output-dir {FEATURES_DIR} \
+                --n-trials {CLUSTER_N_TRIALS} \
+                --sample-size {CLUSTER_SAMPLE_SIZE}
         """
 
 # ============================================================
@@ -283,7 +291,7 @@ rule render_views:
     input:
         gauss_done = GAUSS_DONE,
         gauss_config_txt = GAUSS_CONFIG_TXT,
-        pipeline_cfg = "pipeline/config.yaml"
+        pipeline_cfg = CONFIG_FILE
     output:
         params = f"{VIEWS_DIR}/view_params.json"
     shell:
@@ -294,7 +302,8 @@ rule render_views:
 
         set +u; source activate {ENV_NERFSTUDIO}; set -u; python garfield/render_views_for_labeling.py \
                 --config $GAUSS_CONFIG \
-                --output-dir {VIEWS_DIR}
+                --output-dir {VIEWS_DIR} \
+                --config-yaml {CONFIG_FILE}
         """
 
 # ============================================================
@@ -303,7 +312,8 @@ rule render_views:
 
 rule sam3_inference:
     input:
-        views = f"{VIEWS_DIR}/view_params.json"
+        views = f"{VIEWS_DIR}/view_params.json",
+        pipeline_cfg = CONFIG_FILE
     output:
         done = touch(SAM3_DONE)
     shell:
@@ -356,7 +366,8 @@ rule semantic_labeling:
     input:
         labels = f"{FEATURES_DIR}/cluster_labels.npy",
         views = f"{VIEWS_DIR}/view_params.json",
-        masks_done = SAM3_DONE
+        masks_done = SAM3_DONE,
+        pipeline_cfg = CONFIG_FILE
     output:
         ply = f"{SEMANTIC_OUTPUT}/semantic_pointcloud.ply",
         json = f"{SEMANTIC_OUTPUT}/semantic_labels.json"

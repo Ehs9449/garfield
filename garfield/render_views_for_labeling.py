@@ -71,6 +71,16 @@ def main():
     n_mid = int(cfg["labeling_views"]["n_azimuth_mid"])
     n_top = int(cfg["labeling_views"]["n_top"])
 
+    building_radius = float(cfg["labeling_views"].get("building_radius", 0.7))
+    low_elevation = float(cfg["labeling_views"].get("low_elevation", 15))
+    mid_elevation = float(cfg["labeling_views"].get("mid_elevation", 45))
+    top_elevation = float(cfg["labeling_views"].get("top_elevation", 85))
+
+    building_center = np.array(
+        cfg["garfield"].get("crop_center", [0.02, -0.05, -0.15]),
+        dtype=np.float32
+    )
+
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -111,23 +121,21 @@ def main():
     print(f"✓ Model loaded. Camera: {img_w}x{img_h}")
 
     # Define viewpoints
-    building_center = np.array([0.02, -0.05, -0.15], dtype=np.float32)
-    building_radius = 0.7
 
     views = []
 
     # Low-elevation facade views
     for az in np.linspace(0, 360, n_low, endpoint=False):
-        views.append({'azimuth': int(round(az)), 'elevation': 15, 'type': 'facade'})
+        views.append({'azimuth': int(round(az)), 'elevation': low_elevation, 'type': 'facade'})
 
     # Mid-elevation views
     for az in np.linspace(0, 360, n_mid, endpoint=False):
-        views.append({'azimuth': int(round(az)), 'elevation': 45, 'type': 'elevated'})
+        views.append({'azimuth': int(round(az)), 'elevation': mid_elevation, 'type': 'elevated'})
 
     # Top-down views
     for i in range(n_top):
         az = 0 if n_top == 1 else int(round(i * 360 / n_top))
-        views.append({'azimuth': az, 'elevation': 85, 'type': 'top'})
+        views.append({'azimuth': az, 'elevation': top_elevation, 'type': 'top'})
 
     print(f"Rendering {len(views)} views...")
 
