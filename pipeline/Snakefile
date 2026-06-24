@@ -66,6 +66,11 @@ HPC_ACCOUNT = cfg["hpc"]["account"]
 HPC_PARTITION = cfg["hpc"]["partition"]
 HF_TOKEN = cfg["hpc"]["hf_token"]
 
+SAM3_CONFIDENCE = cfg["sam3"]["confidence_threshold"]
+SAM3_CHECKPOINT = cfg["sam3"]["checkpoint"]
+SAM3_BPE_PATH = cfg["sam3"]["bpe_path"]
+MATCH_MIN_IOU = cfg["matching"]["min_iou"]
+
 # ============================================================
 # Helper: auto-detect latest nerfstudio config
 # ============================================================
@@ -331,6 +336,10 @@ rule sam3_inference:
         scp -o ControlPath=/tmp/hpc-snake -r \
             {VIEWS_DIR} {HPC_USER}@{HPC_HOST}:{HPC_WORK}/labeling_views
 
+        # Upload pipeline config to HPC
+        scp -o ControlPath=/tmp/hpc-snake pipeline/config.yaml \
+            {HPC_USER}@{HPC_HOST}:{HPC_WORK}/pipeline_config.yaml
+
         # SAM3 inference script is already stored on HPC at:
         # {HPC_WORK}/run_sam3_finetuned_pcs.py
 
@@ -342,7 +351,7 @@ rule sam3_inference:
             export HF_HOME={HPC_WORK}/.cache/huggingface
             cd {HPC_WORK}/sam3_repo
             srun -t 02:00:00 -N1 -n1 --cpus-per-task=64 --gres=gpu:1 -p {HPC_PARTITION} -A {HPC_ACCOUNT} \
-                python {HPC_WORK}/run_sam3_finetuned_pcs.py
+                python {HPC_WORK}/run_sam3_finetuned_pcs.py --config-yaml {HPC_WORK}/pipeline_config.yaml
         '
 
         # Download results
@@ -378,7 +387,8 @@ rule semantic_labeling:
                 --labels-npy {LABELS_NPY} \
                 --views-dir {VIEWS_DIR} \
                 --masks-dir {MASKS_DIR} \
-                --output-dir {SEMANTIC_OUTPUT}
+                --output-dir {SEMANTIC_OUTPUT} \
+                --min-iou {MATCH_MIN_IOU}
         """
 
 # ============================================================

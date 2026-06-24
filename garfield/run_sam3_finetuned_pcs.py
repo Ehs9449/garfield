@@ -1,4 +1,6 @@
 import os
+import argparse
+import yaml
 import json
 import torch
 import numpy as np
@@ -6,22 +8,19 @@ from PIL import Image
 from pathlib import Path
 
 # Paths
-bpe_path = "/work/eaghae1/sam3_repo/assets/bpe_simple_vocab_16e6.txt.gz"
-checkpoint_path = "/work/eaghae1/sam3_finetune_hdb/checkpoints/checkpoint.pt"
-views_dir = "/work/eaghae1/labeling_views"
-output_dir = "/work/eaghae1/labeling_masks_finetuned"
+parser = argparse.ArgumentParser()
+parser.add_argument("--config-yaml", default="/work/eaghae1/pipeline_config.yaml",
+                    help="Pipeline config YAML copied from local machine")
+args = parser.parse_args()
 
-os.makedirs(output_dir, exist_ok=True)
+with open(args.config_yaml, "r") as f:
+    cfg = yaml.safe_load(f)
 
-# Building element prompts
-prompts = [
-    "window", "wall", "roof", "door", "column",
-    "beam", "ceiling", "floor", "curtain wall",
-    "opening", "vegetation", "ground", "sky",
-    "staircase", "railing"
-]
+bpe_path = cfg["sam3"]["bpe_path"]
+checkpoint_path = cfg["sam3"]["checkpoint"]
+confidence_threshold = float(cfg["sam3"]["confidence_threshold"])
+prompts = cfg["sam3"]["prompts"]
 
-# Build model
 print("Building model...")
 from sam3 import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
@@ -36,7 +35,7 @@ model.load_state_dict(ckpt["model"], strict=False)
 model.eval()
 print(f"Loaded checkpoint from epoch {ckpt['epoch']}")
 
-processor = Sam3Processor(model, confidence_threshold=0.3)
+processor = Sam3Processor(model, confidence_threshold=confidence_threshold)
 
 # Get view images
 view_files = sorted([f for f in Path(views_dir).iterdir() if f.suffix == ".jpg"])
