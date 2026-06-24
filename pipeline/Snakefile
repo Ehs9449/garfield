@@ -344,8 +344,10 @@ rule sam3_inference:
         scp -o ControlPath=/tmp/hpc-snake pipeline/config.yaml \
             {HPC_USER}@{HPC_HOST}:{HPC_WORK}/pipeline_config.yaml
 
-        # SAM3 inference script is already stored on HPC at:
-        # {HPC_WORK}/run_sam3_finetuned_pcs.py
+        # Upload current SAM3 inference script from this Git repository to HPC
+        scp -o ControlPath=/tmp/hpc-snake \
+            garfield/run_sam3_finetuned_pcs.py \
+            {HPC_USER}@{HPC_HOST}:{HPC_WORK}/run_sam3_finetuned_pcs.py
 
         # Run SAM 3 on HPC
         echo "Running SAM 3 inference on HPC..."
