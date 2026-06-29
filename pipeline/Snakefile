@@ -328,6 +328,9 @@ rule sam3_inference:
         echo "  Enter HPC password when prompted"
         echo "============================================"
 
+        # Remove stale SSH control socket from previous interrupted runs
+        rm -f /tmp/hpc-snake
+
         # Open persistent SSH connection (password asked once)
         ssh -M -S /tmp/hpc-snake -fN {HPC_USER}@{HPC_HOST}
 
@@ -349,6 +352,10 @@ rule sam3_inference:
             garfield/run_sam3_finetuned_pcs.py \
             {HPC_USER}@{HPC_HOST}:{HPC_WORK}/run_sam3_finetuned_pcs.py
 
+        # Clean old masks on HPC so previous experiments do not mix with current run
+        ssh -S /tmp/hpc-snake {HPC_USER}@{HPC_HOST} \
+            "rm -rf {HPC_WORK}/labeling_masks_finetuned && mkdir -p {HPC_WORK}/labeling_masks_finetuned"
+
         # Run SAM 3 on HPC
         echo "Running SAM 3 inference on HPC..."
         ssh -S /tmp/hpc-snake {HPC_USER}@{HPC_HOST} bash -c '
@@ -362,6 +369,7 @@ rule sam3_inference:
 
         # Download results
         echo "Downloading masks from HPC..."
+        rm -rf {MASKS_DIR}
         mkdir -p {MASKS_DIR}
         scp -o ControlPath=/tmp/hpc-snake -r \
             {HPC_USER}@{HPC_HOST}:{HPC_WORK}/labeling_masks_finetuned/* \
