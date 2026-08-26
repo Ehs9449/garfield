@@ -27,7 +27,7 @@ class ImgGroupModelConfig(cfg.InstantiateConfig):
     """
 
     sam_model_type: str = "/home/eaghae1/sam2/checkpoints/sam2.1_hiera_l.yaml"
-    sam_model_ckpt: str = "/home/eaghae1/sam2/checkpoints/checkpoint.pt"
+    sam_model_ckpt: str = "/home/eaghae1/sam2/checkpoints/sam2.1_hiera_large.pt"
     sam_kwargs: dict = field(default_factory=lambda: {})
     "Arguments for SAM model (fb)."
 
@@ -107,7 +107,7 @@ class ImgGroupModel:
         
             # Build the model using the YAML and Checkpoint
                 sam2_model = build_sam2(
-                    self.config.sam2_config, 
+                    self.config.sam_model_type, 
                     self.config.sam_model_ckpt, 
                     device=self.device
                 )
