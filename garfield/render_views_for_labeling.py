@@ -20,7 +20,6 @@ from pathlib import Path
 import argparse
 import os
 import json
-import yaml
 import cv2
 
 from nerfstudio.utils.eval_utils import eval_setup
@@ -60,42 +59,15 @@ def main():
     parser.add_argument("--config", type=Path,
                         default=Path("/home/eaghae1/outputs/PFTdrone/garfield-gauss/2026-05-03_101858/config.yml"))
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/labeling_views"))
-    parser.add_argument("--config-yaml", type=Path, default=Path("pipeline/config.yaml"),
-                        help="Pipeline config YAML containing labeling_views settings")
     args = parser.parse_args()
-
-    with open(args.config_yaml, "r") as f:
-        cfg = yaml.safe_load(f)
-
-    n_low = int(cfg["labeling_views"]["n_azimuth_low"])
-    n_mid = int(cfg["labeling_views"]["n_azimuth_mid"])
-    n_top = int(cfg["labeling_views"]["n_top"])
-
-    building_radius = float(cfg["labeling_views"].get("building_radius", 0.7))
-    low_elevation = float(cfg["labeling_views"].get("low_elevation", 15))
-    mid_elevation = float(cfg["labeling_views"].get("mid_elevation", 45))
-    top_elevation = float(cfg["labeling_views"].get("top_elevation", 85))
-
-    building_center = np.array(
-        cfg["garfield"].get("crop_center", [0.02, -0.05, -0.15]),
-        dtype=np.float32
-    )
 
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Clean old rendered views so experiments with different view counts
-    # do not mix old and new images.
-    for old_file in list(output_dir.glob("view_*.jpg")) + list(output_dir.glob("view_*.png")):
-        old_file.unlink()
-    old_params = output_dir / "view_params.json"
-    if old_params.exists():
-        old_params.unlink()
-
     # Load model
     print("Loading Gaussian Splatting model...")
     original_cwd = os.getcwd()
-    os.chdir(Path(__file__).resolve().parents[1])
+    os.chdir("/home/eaghae1")
 
     config, pipeline, checkpoint_path, step = eval_setup(args.config, test_mode='test')
     pipeline.eval()
@@ -121,21 +93,18 @@ def main():
     print(f"✓ Model loaded. Camera: {img_w}x{img_h}")
 
     # Define viewpoints
+    building_center = np.array([0.02, -0.05, -0.15], dtype=np.float32)
+    building_radius = 0.7
 
     views = []
-
-    # Low-elevation facade views
-    for az in np.linspace(0, 360, n_low, endpoint=False):
-        views.append({'azimuth': int(round(az)), 'elevation': low_elevation, 'type': 'facade'})
-
-    # Mid-elevation views
-    for az in np.linspace(0, 360, n_mid, endpoint=False):
-        views.append({'azimuth': int(round(az)), 'elevation': mid_elevation, 'type': 'elevated'})
-
-    # Top-down views
-    for i in range(n_top):
-        az = 0 if n_top == 1 else int(round(i * 360 / n_top))
-        views.append({'azimuth': az, 'elevation': top_elevation, 'type': 'top'})
+    # Facade views every 30 degrees
+    for az in range(0, 360, 30):
+        views.append({'azimuth': az, 'elevation': 15, 'type': 'facade'})
+    # Elevated views every 45 degrees
+    for az in range(0, 360, 45):
+        views.append({'azimuth': az, 'elevation': 45, 'type': 'elevated'})
+    # Top-down
+    views.append({'azimuth': 0, 'elevation': 85, 'type': 'top'})
 
     print(f"Rendering {len(views)} views...")
 
@@ -198,7 +167,7 @@ def main():
         json.dump(all_view_params, f, indent=2)
 
     print(f"\n✓ Saved {len(views)} images + view_params.json to {output_dir}")
-    print("Next: run Snakemake rule sam3_inference to execute run_sam3_finetuned_pcs.py on HPC")
+    print("Next: conda activate sam3 && python run_sam3_pcs.py")
 
 
 if __name__ == "__main__":

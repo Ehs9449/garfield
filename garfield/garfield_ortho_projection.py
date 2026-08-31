@@ -41,7 +41,7 @@ class GarfieldOrthoProjector:
         """Load the GARField model with crop enabled."""
         original_cwd = os.getcwd()
         if data_path and data_path.exists():
-            os.chdir(Path(__file__).resolve().parents[1])
+            os.chdir("/home/eaghae1")
 
         try:
             print("Loading GARField model...")
