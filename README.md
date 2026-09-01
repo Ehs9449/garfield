@@ -1,6 +1,6 @@
-# GARField-Semantic: Drone-to-BIM Semantic Segmentation Pipeline
+# AI-Enabled Geometry Generation, Segmentation, and Interoperability for Digital Twin
 
-AI-Enabled Geometry Generation, Segmentation, and Interoperability for Digital Twin
+Automatic semantic segmentation of building components from drone imagery using GARField (Group Anything with Radiance Fields), 3D Gaussian Splatting, and domain-adapted SAM 3.
 
 > Forked from [chungmin99/garfield](https://github.com/chungmin99/garfield)
 
