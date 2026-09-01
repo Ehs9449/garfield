@@ -31,3 +31,4 @@ data/
 # Backups/logs
 *.bak*
 *.log
+cgal_ksr_project/build/
