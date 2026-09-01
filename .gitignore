@@ -32,3 +32,5 @@ data/
 *.bak*
 *.log
 cgal_ksr_project/build/
+pipeline/config.local.yaml
+pipeline/config.yaml

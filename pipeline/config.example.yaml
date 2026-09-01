@@ -1,0 +1,120 @@
+# ============================================================
+# Drone-to-BIM Semantic Segmentation Pipeline Configuration
+# ============================================================
+# Edit these paths and parameters for your specific project.
+# All pipeline stages read from this config.
+
+# ============================================================
+# Dataset
+# ============================================================
+dataset:
+  name: "PFTdrone"                          # Project name
+  path: "/path/to/your/dataset"       # Path to drone images
+  has_gps: true                             # Do images have GPS data?
+
+# ============================================================
+# COLMAP
+# ============================================================
+colmap:
+  conda_env: "ColmapLnx"
+
+# ============================================================
+# GARField + Gaussian Splatting
+# ============================================================
+garfield:
+  conda_env: "nerfstudio3"
+  # Config paths are auto-detected from outputs/*/garfield/*/config.yml
+  # and outputs/*/garfield-gauss/*/config.yml after training
+  crop_center: [0.02, -0.05, -0.15]
+  crop_scale: [1.0, 0.91, 0.19]
+
+# ============================================================
+# Orthographic Projection
+# ============================================================
+projection:
+  pointcloud: "exports/garfield_pc/point_cloud.ply"
+  scale: 0.05
+  output_dir: "outputs/ortho_projection_s005"
+  n_views: 37
+
+# ============================================================
+# Clustering
+# ============================================================
+clustering:
+  n_trials: 40
+  sample_size: 50000
+  min_cluster_size: 500
+  min_samples: 10
+  cluster_selection_epsilon: 0.0
+
+# ============================================================
+# Labeling Views
+# ============================================================
+labeling_views:
+  output_dir: "outputs/labeling_views"
+
+  n_azimuth_low: 8        # views at low elevation
+  n_azimuth_mid: 4        # views at mid elevation
+  n_top: 1                # top-down views
+
+  building_radius: 0.7    # camera distance from building center
+  low_elevation: 15       # degrees
+  mid_elevation: 45       # degrees
+  top_elevation: 85       # degrees
+
+# ============================================================
+# SAM 3 Inference
+# ============================================================
+sam3:
+  conda_env: "sam3"                                             # local env name
+  hpc_conda_env: "/path/to/your/hpc/conda_envs/sam3"               # HPC env path
+  checkpoint: "/path/to/your/sam3/checkpoint.pt"
+  bpe_path: "/path/to/your/sam3/assets/bpe_simple_vocab_16e6.txt.gz"
+  confidence_threshold: 0.3
+  prompts:
+    - "window"
+    - "wall"
+    - "roof"
+    - "door"
+    - "column"
+    - "beam"
+    - "ceiling"
+    - "floor"
+    - "curtain wall"
+    - "opening"
+    - "vegetation"
+    - "ground"
+    - "sky"
+    - "staircase"
+    - "railing"
+
+# ============================================================
+# HPC
+# ============================================================
+hpc:
+  user: "your_hpc_username"
+  host: "your.hpc.hostname"
+  work_dir: "/path/to/your/hpc/workdir"
+  account: "your_hpc_account"
+  partition: "gpu"
+  hf_token: ""
+
+# ============================================================
+# Matching
+# ============================================================
+matching:
+  features_dir: "outputs/ortho_projection_cropped"
+  labels_npy: "outputs/ortho_projection_cropped/cluster_labels.npy"
+  min_iou: 0.05
+  output_dir: "outputs/semantic_labels_finetuned"
+
+# ============================================================
+# SAM 3 Fine-tuning
+# ============================================================
+sam3_finetune:
+  hdb_dataset: "/path/to/your/HDB_COCO"
+  epochs: 30
+  gpus: 4
+  batch_size: 1
+  checkpoint_freq: 5
+  output_dir: "/path/to/your/sam3_finetune_output"
