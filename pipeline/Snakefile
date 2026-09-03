@@ -160,7 +160,7 @@ rule garfield_train:
         echo "============================================"
 
         set +u; source activate {ENV_NERFSTUDIO}; set -u; ns-train garfield --viewer.quit-on-train-completion True colmap \
-                --data data/{DATASET_NAME} \
+                --data {DATASET_PATH} \
                 --colmap-path sparse/0/
 
         GARFIELD_CONFIG=$(realpath $(find outputs -path "*/garfield/*/config.yml" -type f -printf "%T@ %p\n" | sort -nr | head -1 | cut -d" " -f2-))
