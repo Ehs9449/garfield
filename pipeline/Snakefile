@@ -64,11 +64,11 @@ HPC_HOST = cfg["hpc"]["host"]
 HPC_WORK = cfg["hpc"]["work_dir"]
 HPC_ACCOUNT = cfg["hpc"]["account"]
 HPC_PARTITION = cfg["hpc"]["partition"]
-HF_TOKEN = cfg["hpc"]["hf_token"]
 
 SAM3_CONFIDENCE = cfg["sam3"]["confidence_threshold"]
 SAM3_CHECKPOINT = cfg["sam3"]["checkpoint"]
 SAM3_BPE_PATH = cfg["sam3"]["bpe_path"]
+HPC_CONDA_ENV = cfg["sam3"]["hpc_conda_env"]
 MATCH_MIN_IOU = cfg["matching"]["min_iou"]
 
 # ============================================================
@@ -234,7 +234,7 @@ rule export_garfield_pointcloud:
         echo "============================================"
         echo "Using config: $GARFIELD_CONFIG"
 
-        set +u; source activate nerfstudio3; set -u; ns-export pointcloud \
+        set +u; source activate {ENV_NERFSTUDIO}; set -u; ns-export pointcloud \
             --load-config "$GARFIELD_CONFIG" \
             --output-dir $(dirname {output.pc}) \
             --num-points 1000000 \
@@ -260,7 +260,6 @@ rule ortho_projection:
         test -f "$GARFIELD_CONFIG"
         echo "Using GARField config: $GARFIELD_CONFIG"
 
-        cd /home/eaghae1/garfield-semantic
         set +u; source activate {ENV_NERFSTUDIO}; set -u; python garfield/garfield_ortho_projection.py \
                 --config $GARFIELD_CONFIG \
                 --pointcloud {input.pc} \
@@ -352,6 +351,7 @@ rule sam3_inference:
             garfield/run_sam3_finetuned_pcs.py \
             {HPC_USER}@{HPC_HOST}:{HPC_WORK}/run_sam3_finetuned_pcs.py
 
+
         # Clean old masks on HPC so previous experiments do not mix with current run
         ssh -S /tmp/hpc-snake {HPC_USER}@{HPC_HOST} \
             "rm -rf {HPC_WORK}/labeling_masks_finetuned && mkdir -p {HPC_WORK}/labeling_masks_finetuned"
@@ -359,9 +359,7 @@ rule sam3_inference:
         # Run SAM 3 on HPC
         echo "Running SAM 3 inference on HPC..."
         ssh -S /tmp/hpc-snake {HPC_USER}@{HPC_HOST} bash -c '
-            set +u; source activate {HPC_WORK}/conda_envs/sam3; set -u
-            export HF_TOKEN="{HF_TOKEN}"
-            export HF_HOME={HPC_WORK}/.cache/huggingface
+            set +u; source activate {HPC_CONDA_ENV}; set -u
             cd {HPC_WORK}/sam3_repo
             srun -t 02:00:00 -N1 -n1 --cpus-per-task=64 --gres=gpu:1 -p {HPC_PARTITION} -A {HPC_ACCOUNT} \
                 python {HPC_WORK}/run_sam3_finetuned_pcs.py --config-yaml {HPC_WORK}/pipeline_config.yaml

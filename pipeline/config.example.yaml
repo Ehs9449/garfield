@@ -53,8 +53,8 @@ clustering:
 labeling_views:
   output_dir: "outputs/labeling_views"
 
-  n_azimuth_low: 8        # views at low elevation
-  n_azimuth_mid: 4        # views at mid elevation
+  n_azimuth_low: 12        # views at low elevation
+  n_azimuth_mid: 8        # views at mid elevation
   n_top: 1                # top-down views
 
   building_radius: 0.7    # camera distance from building center
@@ -97,7 +97,6 @@ hpc:
   work_dir: "/path/to/your/hpc/workdir"
   account: "your_hpc_account"
   partition: "gpu"
-  hf_token: ""
 
 # ============================================================
 # Matching

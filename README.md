@@ -4,6 +4,28 @@ Automatic semantic segmentation of building components from drone imagery using 
 
 > Forked from [chungmin99/garfield](https://github.com/chungmin99/garfield)
 
+## Overview and Purpose
+
+This repository provides the AI-Enabled Geometry Generation and Interoperability component of the Socio-Technical Cyberinfrastructure for Digital Twins (STC-DT) ecosystem. Its purpose is to transform drone imagery into semantically enriched 3D representations of buildings that can support downstream digital twin and BIM workflows.
+
+The current pipeline combines photogrammetry, neural scene representation, feature-based grouping, semantic segmentation, and point-cloud labeling. It is designed to identify and organize building components such as walls, roofs, windows, and doors, and to generate structured geometric outputs that can be used for digital twin development, scan-to-BIM processing, and interoperability with other STC-DT components.
+
+## Key Capabilities
+
+- **Drone-to-3D reconstruction:** Processes multi-view drone imagery using COLMAP to estimate camera poses and generate the geometric foundation for 3D reconstruction.
+- **Neural 3D scene representation:** Uses GARField and 3D Gaussian Splatting to reconstruct the scene and extract grouping features across multiple viewpoints.
+- **Building-component segmentation:** Uses a domain-adapted SAM 3 model to identify building components such as walls, roofs, windows, and doors.
+- **3D feature clustering:** Projects learned GARField features into 3D and groups geometrically and semantically related points using GPU-accelerated HDBSCAN with parameter search based on silhouette score.
+- **Semantic 3D labeling:** Associates 2D segmentation masks with 3D clusters to generate semantically labeled point clouds.
+- **Geometry processing:** Supports downstream geometric processing of reconstructed building components for digital twin and BIM applications.
+- **Reproducible workflow:** Integrates the major processing stages through a configurable Snakemake pipeline.
+
+## Role in the STC-DT Ecosystem
+
+This repository serves as the geometry-focused component of the STC-DT ecosystem. It converts visual observations of the built environment into semantically enriched 3D representations that can be exchanged with other digital twin components.
+
+Within STC-DT, the generated geometry and semantic information can provide a spatial foundation for integration with knowledge graphs, BIM information, infrastructure data, sensor information, and other digital twin resources. The component therefore connects AI-based reality capture and scene understanding with higher-level semantic and digital twin interoperability workflows.
+
 ## Pipeline Overview
 
 ```
@@ -72,9 +94,42 @@ Automatic semantic segmentation of building components from drone imagery using 
 - SAM 3 with fine-tuned checkpoint (conda env: `sam3`, on HPC)
 - Snakemake: `pip install snakemake pyyaml`
 
+### Configuration
+
+Create your local configuration from the provided template:
+
+```bash
+cp pipeline/config.example.yaml pipeline/config.yaml
+```
+
+Then edit `pipeline/config.yaml` for your machine, dataset, and HPC environment.
+
+The main project-specific settings are:
+
+| Variable | Description |
+|---|---|
+| `dataset.name` | Project name used to organize the pipeline outputs |
+| `dataset.path` | Path to the input drone-image dataset |
+| `colmap.conda_env` | Conda environment containing COLMAP |
+| `garfield.conda_env` | Conda environment containing Nerfstudio and GARField |
+| `sam3.hpc_conda_env` | Path to the SAM 3 Conda environment on the HPC system |
+| `sam3.checkpoint` | Path to the fine-tuned SAM 3 checkpoint |
+| `sam3.bpe_path` | Path to the SAM 3 BPE vocabulary file |
+| `hpc.user` | HPC username |
+| `hpc.host` | HPC hostname |
+| `hpc.work_dir` | Working directory on the HPC system |
+| `hpc.account` | HPC allocation/account |
+| `hpc.partition` | GPU partition used for SAM 3 inference |
+
+Other parameters, such as projection scale, clustering settings, labeling viewpoints, SAM 3 confidence threshold and prompts, and matching threshold, have example values in `pipeline/config.example.yaml` and can be adjusted for a specific experiment.
+
+The `sam3_finetune` settings are only required when fine-tuning SAM 3. If an existing fine-tuned checkpoint is used, configure `sam3.checkpoint` instead.
+
+`pipeline/config.yaml` is intentionally excluded from Git because it contains machine-specific configuration. Do not store passwords, API keys, access tokens, or other secrets in this file.
+
 ### Run
 
-1. Place your drone images in `data/YOUR_PROJECT/images/`
+1. Place your drone images in the `images/` subdirectory of the dataset path specified by `dataset.path` in `pipeline/config.yaml`
 2. Edit `pipeline/config.yaml` with your dataset paths and parameters
 3. Run the full pipeline:
 

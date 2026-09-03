@@ -8,7 +8,7 @@ averages across views, and clusters with HDBSCAN.
 
 Usage:
     python garfield_ortho_projection.py \
-        --config /home/eaghae1/outputs/unnamed/garfield/2026-04-30_092326/config.yml \
+        --config /path/to/garfield/config.yml \
         --pointcloud /path/to/pointcloud.ply \
         --scale 0.1 \
         --output-dir outputs/ortho_projection
@@ -39,33 +39,27 @@ class GarfieldOrthoProjector:
 
     def __init__(self, config_path: Path, data_path: Path = None):
         """Load the GARField model with crop enabled."""
-        original_cwd = os.getcwd()
-        if data_path and data_path.exists():
-            os.chdir("/home/eaghae1")
 
-        try:
-            print("Loading GARField model...")
-            config, self.pipeline, checkpoint_path, step = eval_setup(
-                config_path, test_mode='test'
-            )
-            self.device = self.pipeline.device
-            print("✓ Model loaded successfully")
+        print("Loading GARField model...")
+        config, self.pipeline, checkpoint_path, step = eval_setup(
+            config_path, test_mode='test'
+        )
+        self.device = self.pipeline.device
+        print("✓ Model loaded successfully")
 
-            # Enable cropping to building bounding box
-            crop_center = torch.tensor([0.02, -0.05, -0.15], device=self.device)
-            crop_scale = torch.tensor([1.0, 0.91, 0.19], device=self.device)
-            crop_min = crop_center - crop_scale / 2
-            crop_max = crop_center + crop_scale / 2
+        # Enable cropping to building bounding box
+        crop_center = torch.tensor([0.02, -0.05, -0.15], device=self.device)
+        crop_scale = torch.tensor([1.0, 0.91, 0.19], device=self.device)
+        crop_min = crop_center - crop_scale / 2
+        crop_max = crop_center + crop_scale / 2
 
-            self.pipeline.model.crop_enabled = True
-            self.pipeline.model.crop_min = crop_min
-            self.pipeline.model.crop_max = crop_max
-            self.pipeline.model.crop_bg_color = torch.tensor([1.0, 1.0, 1.0], device=self.device)
+        self.pipeline.model.crop_enabled = True
+        self.pipeline.model.crop_min = crop_min
+        self.pipeline.model.crop_max = crop_max
+        self.pipeline.model.crop_bg_color = torch.tensor([1.0, 1.0, 1.0], device=self.device)
 
-            print(f"✓ Crop enabled: min={crop_min.tolist()}, max={crop_max.tolist()}")
+        print(f"✓ Crop enabled: min={crop_min.tolist()}, max={crop_max.tolist()}")
 
-        finally:
-            os.chdir(original_cwd)
 
     def render_ortho_features(self, plane_center, look_dir, up_vec,
                                width, height, img_width, img_height,
@@ -665,7 +659,7 @@ def main():
     )
 
     parser.add_argument("--config", type=Path,
-                        default=Path("/home/eaghae1/outputs/unnamed/garfield/2026-04-30_092326/config.yml"),
+                        required=True,
                         help="Path to GARField config.yml")
     parser.add_argument("--pointcloud", type=Path, required=True,
                         help="Path to point cloud PLY file")
@@ -696,7 +690,7 @@ def main():
         # Full pipeline: render + project + cluster
         projector = GarfieldOrthoProjector(
             config_path=args.config,
-            data_path=Path("/home/eaghae1/data/PFTdrone")
+            data_path=None
         )
 
         projector.run_pipeline(
