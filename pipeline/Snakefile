@@ -30,18 +30,23 @@ DATASET_PATH = cfg["dataset"]["path"]
 DATASET_NAME = cfg["dataset"]["name"]
 HAS_GPS = cfg["dataset"]["has_gps"]
 
-PROJECTION_SCALE = cfg["projection"]["scale"]
-PROJECTION_OUTPUT = cfg["projection"]["output_dir"]
-PC_PATH = cfg["projection"]["pointcloud"]
+DATASET_OUTPUT_DIR = f"outputs/{DATASET_NAME}"
 
-VIEWS_DIR = cfg["labeling_views"]["output_dir"]
+PROJECTION_SCALE = cfg["projection"]["scale"]
+PROJECTION_OUTPUT = os.path.join(DATASET_OUTPUT_DIR, os.path.basename(cfg["projection"]["output_dir"]))
+PC_PATH = os.path.join(DATASET_OUTPUT_DIR, "exports", os.path.basename(cfg["projection"]["pointcloud"]))
+
+CROP_CENTER = cfg["garfield"]["crop_center"]
+CROP_SCALE = cfg["garfield"]["crop_scale"]
+
+VIEWS_DIR = os.path.join(DATASET_OUTPUT_DIR, os.path.basename(cfg["labeling_views"]["output_dir"]))
 
 CLUSTER_N_TRIALS = cfg["clustering"].get("n_trials", 40)
 CLUSTER_SAMPLE_SIZE = cfg["clustering"].get("sample_size", 50000)
-MASKS_DIR = "outputs/labeling_masks_finetuned"
-FEATURES_DIR = cfg["matching"]["features_dir"]
-LABELS_NPY = cfg["matching"]["labels_npy"]
-SEMANTIC_OUTPUT = cfg["matching"]["output_dir"]
+MASKS_DIR = os.path.join(DATASET_OUTPUT_DIR, "labeling_masks_finetuned")
+FEATURES_DIR = os.path.join(DATASET_OUTPUT_DIR, os.path.basename(cfg["matching"]["features_dir"]))
+LABELS_NPY = os.path.join(FEATURES_DIR, "cluster_labels.npy")
+SEMANTIC_OUTPUT = os.path.join(DATASET_OUTPUT_DIR, os.path.basename(cfg["matching"]["output_dir"]))
 
 GARFIELD_CONFIG_TXT = f"outputs/{DATASET_NAME}/garfield_config.txt"
 GAUSS_CONFIG_TXT = f"outputs/{DATASET_NAME}/garfield_gauss_config.txt"
@@ -198,9 +203,11 @@ rule garfield_gauss_train:
         set +u; source activate {ENV_NERFSTUDIO}; set -u; ns-train garfield-gauss \
                 --pipeline.garfield-ckpt $GARFIELD_CONFIG \
                 --viewer.quit-on-train-completion True \
-                --data data/{DATASET_NAME} \
                 --pipeline.datamanager.camera-res-scale-factor 0.25 \
-                --pipeline.datamanager.cache-images cpu
+                --pipeline.datamanager.cache-images cpu \
+                colmap \
+                --data {DATASET_PATH} \
+                --colmap-path sparse/0/
 
         GAUSS_CONFIG=$(realpath $(find outputs -path "*/garfield-gauss/*/config.yml" -type f -printf "%T@ %p\n" | sort -nr | head -1 | cut -d" " -f2-))
         test -f "$GAUSS_CONFIG"
@@ -264,6 +271,8 @@ rule ortho_projection:
                 --config $GARFIELD_CONFIG \
                 --pointcloud {input.pc} \
                 --scale {PROJECTION_SCALE} \
+                --crop-center {CROP_CENTER[0]} {CROP_CENTER[1]} {CROP_CENTER[2]} \
+                --crop-scale {CROP_SCALE[0]} {CROP_SCALE[1]} {CROP_SCALE[2]} \
                 --output-dir {PROJECTION_OUTPUT}
         """
 

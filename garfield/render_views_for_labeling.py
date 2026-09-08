@@ -160,7 +160,7 @@ def main():
         rgb_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
         # Save image
-        view_name = f"view_{i:03d}_az{view['azimuth']:03d}_el{view['elevation']:02d}"
+        view_name = f"view_{i:03d}_az{int(view['azimuth']):03d}_el{int(round(view['elevation'])):02d}"
         img_path = output_dir / f"{view_name}.jpg"
         cv2.imwrite(str(img_path), rgb_bgr)
 

@@ -37,7 +37,8 @@ class GarfieldOrthoProjector:
     into those rendered views to collect smooth features.
     """
 
-    def __init__(self, config_path: Path, data_path: Path = None):
+    def __init__(self, config_path: Path, data_path: Path = None,
+                 crop_center=None, crop_scale=None):
         """Load the GARField model with crop enabled."""
 
         print("Loading GARField model...")
@@ -48,10 +49,18 @@ class GarfieldOrthoProjector:
         print("✓ Model loaded successfully")
 
         # Enable cropping to building bounding box
-        crop_center = torch.tensor([0.02, -0.05, -0.15], device=self.device)
-        crop_scale = torch.tensor([1.0, 0.91, 0.19], device=self.device)
-        crop_min = crop_center - crop_scale / 2
-        crop_max = crop_center + crop_scale / 2
+        if crop_center is None:
+            crop_center = [0.02, -0.05, -0.15]
+        if crop_scale is None:
+            crop_scale = [1.0, 0.91, 0.19]
+
+        self.crop_center = np.array(crop_center, dtype=np.float32)
+        self.crop_scale = np.array(crop_scale, dtype=np.float32)
+
+        crop_center_t = torch.tensor(self.crop_center, device=self.device)
+        crop_scale_t = torch.tensor(self.crop_scale, device=self.device)
+        crop_min = crop_center_t - crop_scale_t / 2
+        crop_max = crop_center_t + crop_scale_t / 2
 
         self.pipeline.model.crop_enabled = True
         self.pipeline.model.crop_min = crop_min
@@ -237,9 +246,9 @@ class GarfieldOrthoProjector:
         print(f"  Loaded {len(points)} points")
         print(f"  Bounds: {points.min(axis=0)} to {points.max(axis=0)}")
 
-        # Crop to building bounding box from camera_path.json
-        crop_center = np.array([0.02, -0.05, -0.15])
-        crop_scale = np.array([1.0, 0.91, 0.19])
+        # Crop to configured building bounding box
+        crop_center = self.crop_center
+        crop_scale = self.crop_scale
         crop_padding = 1.1  # 10% padding beyond crop box
         crop_min = crop_center - (crop_scale * crop_padding) / 2
         crop_max = crop_center + (crop_scale * crop_padding) / 2
@@ -270,9 +279,9 @@ class GarfieldOrthoProjector:
         print("STEP 2: Generating dense orthographic views")
         print("=" * 60)
 
-        # Building crop bounds from camera_path.json
-        cx, cy, cz = 0.02, -0.05, -0.15       # crop_center
-        sx, sy, sz = 1.0,   0.91,  0.19        # crop_scale
+        # Building crop bounds
+        cx, cy, cz = self.crop_center
+        sx, sy, sz = self.crop_scale
         padding = 1.3  # 30% padding to avoid clipping edges
 
         # Bounding box
@@ -667,6 +676,14 @@ def main():
                         help="GARField grouping scale (0.1 = fine components)")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/ortho_projection"),
                         help="Output directory")
+    parser.add_argument("--crop-center", type=float, nargs=3,
+                        default=[0.02, -0.05, -0.15],
+                        metavar=("X", "Y", "Z"),
+                        help="Crop box center as X Y Z")
+    parser.add_argument("--crop-scale", type=float, nargs=3,
+                        default=[1.0, 0.91, 0.19],
+                        metavar=("SX", "SY", "SZ"),
+                        help="Crop box size as SX SY SZ")
     parser.add_argument("--resolution", type=int, default=1080,
                         help="Image resolution for rendering")
     parser.add_argument("--load-features", action="store_true",
@@ -690,7 +707,9 @@ def main():
         # Full pipeline: render + project + cluster
         projector = GarfieldOrthoProjector(
             config_path=args.config,
-            data_path=None
+            data_path=None,
+            crop_center=args.crop_center,
+            crop_scale=args.crop_scale
         )
 
         projector.run_pipeline(
