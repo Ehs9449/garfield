@@ -72,7 +72,7 @@ def main():
     low_elevation = float(cfg["labeling_views"].get("low_elevation", 15))
     mid_elevation = float(cfg["labeling_views"].get("mid_elevation", 45))
     top_elevation = float(cfg["labeling_views"].get("top_elevation", 85))
-    
+
     patch_test_center = np.array(cfg["labeling_views"]["patch_test_center"], dtype=np.float32)
     patch_test_radius = float(cfg["labeling_views"]["patch_test_radius"])
 
@@ -82,7 +82,7 @@ def main():
     )
 
     output_dir = args.output_dir
-    
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load model
@@ -111,47 +111,50 @@ def main():
     os.chdir(original_cwd)
     print(f"✓ Model loaded. Camera: {img_w}x{img_h}")
 
-    # Define viewpoints
-    
+    # COLMAP/Nerfstudio-guided viewpoints
+    training_poses = np.load("outputs/towerlsu/training_camera_poses.npy")
+
+    # Sample across the entire acquisition path so low, middle, and high views are preserved.
+    n_guided_views = min(96, len(training_poses))
+    selected_indices = np.linspace(
+        0, len(training_poses) - 1, n_guided_views, dtype=int
+    )
+
     views = []
-    # Low-elevation facade views
-    for az in np.linspace(0, 360, n_low, endpoint=False):
-        views.append({'azimuth': int(round(az)), 'elevation': low_elevation, 'type': 'facade'})
+    for j, pose_idx in enumerate(selected_indices):
+        c2w = training_poses[pose_idx].astype(np.float32).copy()
 
-    # Mid-elevation views
-    for az in np.linspace(0, 360, n_mid, endpoint=False):
-        views.append({'azimuth': int(round(az)), 'elevation': mid_elevation, 'type': 'elevated'})
-    # Top-down views
-    for i in range(n_top):
-        az = 0 if n_top == 1 else int(round(i * 360 / n_top))
-        views.append({'azimuth': az, 'elevation': top_elevation, 'type': 'top'})
+        # Small deterministic perturbation so the rendered pose differs slightly
+        # from the original training camera while preserving its useful viewpoint.
+        yaw_deg = 3.0 if j % 2 == 0 else -3.0
+        yaw = np.radians(yaw_deg)
 
-    # Experimental local facade views around P3
-    for az in [0, 45, 90, 135, 180, 225, 270, 315]:
-        views.append({"azimuth": az, "elevation": 0, "type": "patch_test"})
+        yaw_local = np.array([
+            [ np.cos(yaw), 0.0, np.sin(yaw)],
+            [ 0.0,         1.0, 0.0        ],
+            [-np.sin(yaw), 0.0, np.cos(yaw)]
+        ], dtype=np.float32)
 
-    print(f"Rendering {len(views)} views...")
+        c2w[:, :3] = c2w[:, :3] @ yaw_local
+
+        # Tiny position offset along the camera-right direction.
+        offset = 0.008 if j % 2 == 0 else -0.008
+        c2w[:, 3] += offset * c2w[:, 0]
+
+        views.append({
+            "pose_index": int(pose_idx),
+            "c2w": c2w,
+            "type": "colmap_guided",
+            "azimuth": 0,
+            "elevation": 0,
+        })
+
+    print(f"Rendering {len(views)} COLMAP-guided views...")
 
     all_view_params = []
 
     for i, view in enumerate(views):
-        az = np.radians(view['azimuth'])
-        el = np.radians(view['elevation'])
-
-        if view["type"] == "patch_test":
-            target_center = patch_test_center
-            radius = patch_test_radius
-        else:
-            target_center = building_center
-            radius = building_radius
-
-        cam_pos = [
-            target_center[0] + radius * np.cos(az) * np.cos(el),
-            target_center[1] + radius * np.sin(az) * np.cos(el),
-            target_center[2] + radius * np.sin(el),
-        ]
-
-        c2w = build_c2w_matrix(cam_pos, target_center)
+        c2w = view["c2w"]
         c2w_tensor = torch.from_numpy(c2w)
 
         # Create nerfstudio Camera

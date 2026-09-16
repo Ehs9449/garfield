@@ -227,8 +227,23 @@ def main():
 
         if votes:
             label_counts = Counter(v['label'] for v in votes)
-            best_label = label_counts.most_common(1)[0][0]
-            best_count = label_counts.most_common(1)[0][1]
+
+            # Treat "wall" as a fallback:
+            # if any non-wall semantic label received votes,
+            # choose the most-voted non-wall label.
+            non_wall_counts = {
+                label: count
+                for label, count in label_counts.items()
+                if label != "wall"
+            }
+
+            if non_wall_counts:
+                best_label = max(non_wall_counts, key=non_wall_counts.get)
+                best_count = non_wall_counts[best_label]
+            else:
+                best_label = "wall"
+                best_count = label_counts["wall"]
+
             confidence = best_count / len(votes)
             avg_iou = np.mean([v['iou'] for v in votes if v['label'] == best_label])
 

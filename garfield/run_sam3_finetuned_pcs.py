@@ -53,7 +53,7 @@ print(f"Found {len(view_files)} views")
 # Process each view
 for img_path in view_files:
     print(f"\nProcessing: {img_path.name}")
-    img = np.array(Image.open(img_path).convert("RGB"))
+    img = Image.open(img_path).convert("RGB")
     
     view_results = {}
     for prompt in prompts:
