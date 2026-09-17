@@ -28,6 +28,18 @@ CROP_CENTER = cfg["garfield"]["crop_center"]
 CROP_SCALE = cfg["garfield"]["crop_scale"]
 
 PROJECTION_SCALE = cfg["projection"]["scale"]
+
+PROJ_N_SIDE = cfg["projection"].get("n_side", 4)
+PROJ_SIDE_ELEVATIONS = " ".join(
+    str(v) for v in cfg["projection"].get("side_elevations", [0.0])
+)
+PROJ_N_TOP_RING = cfg["projection"].get("n_top_ring", 4)
+PROJ_TOP_ELEVATIONS = " ".join(
+    str(v) for v in cfg["projection"].get("top_elevations", [80.0])
+)
+PROJ_AZIMUTH_OFFSET = cfg["projection"].get("azimuth_offset", 0.0)
+PROJ_DIST_FACTOR = cfg["projection"].get("dist_factor", 1.5)
+PROJ_RESOLUTION = cfg["projection"].get("resolution", 1080)
 PROJECTION_OUTPUT = os.path.join(
     DATASET_OUTPUT_DIR,
     os.path.basename(cfg["projection"]["output_dir"])
@@ -47,6 +59,8 @@ CLUSTER_DIR = os.path.join(
 
 CLUSTER_N_TRIALS = cfg["clustering"].get("n_trials", 40)
 CLUSTER_SAMPLE_SIZE = cfg["clustering"].get("sample_size", 50000)
+CLUSTER_MIN_CLUSTERS = cfg["clustering"].get("optimization_min_clusters", 50)
+CLUSTER_MAX_CLUSTERS = cfg["clustering"].get("optimization_max_clusters", 120)
 
 MERGE_DIR = os.path.join(
     DATASET_OUTPUT_DIR,
@@ -57,6 +71,13 @@ SAM_CACHE = cfg["merging"]["sam_cache"]
 MIN_CLUSTER_FRACTION = cfg["merging"].get("min_cluster_fraction", 0.50)
 MIN_SUPPORT = cfg["merging"].get("min_support", 50)
 MIN_COSINE = cfg["merging"].get("min_cosine", 0.90)
+
+MERGE_MAX_ELEVATION = cfg["merging"].get("max_elevation_deg", 35.0)
+MERGE_MAX_INCIDENCE = cfg["merging"].get("max_incidence_deg", 30.0)
+MERGE_MAX_OFFAXIS = cfg["merging"].get("max_offaxis_deg", 40.0)
+MERGE_FACADE_AZIMUTHS = " ".join(
+    str(v) for v in cfg["merging"].get("facade_azimuths", [0, 90, 180, 270])
+)
 
 VIEWS_DIR = os.path.join(
     DATASET_OUTPUT_DIR,
@@ -114,6 +135,13 @@ HPC_HOST = cfg["hpc"]["host"]
 HPC_WORK = cfg["hpc"]["work_dir"]
 HPC_ACCOUNT = cfg["hpc"]["account"]
 HPC_PARTITION = cfg["hpc"]["partition"]
+
+# Slurm request for the SAM3 job. Asking for a whole node's worth of CPUs
+# makes the job wait for a completely empty node, even though the work is
+# on the GPU. A small CPU request starts much sooner.
+HPC_CPUS = cfg["hpc"].get("cpus_per_task", 8)
+HPC_GPUS = cfg["hpc"].get("gpus", 1)
+HPC_TIME_LIMIT = cfg["hpc"].get("time_limit", "02:00:00")
 
 HPC_CONDA_ENV = cfg["sam3"]["hpc_conda_env"]
 
@@ -318,10 +346,10 @@ rule export_garfield_pointcloud:
 
 
 # ============================================================
-# Stage 4: COLMAP-Guided + Roof Orthographic Projection
+# Stage 4: Side + Roof Orthographic Projection
 #
-# NOTE:
-# training_camera_poses.npy is currently a required input.
+# Views are facade-facing side views plus roof views, generated from
+# the crop box. Training camera poses are no longer needed here.
 # ============================================================
 
 rule ortho_projection:
@@ -329,7 +357,6 @@ rule ortho_projection:
         garfield_done = GARFIELD_DONE,
         garfield_config_txt = GARFIELD_CONFIG_TXT,
         pc = PC_PATH,
-        poses = TRAINING_POSES,
         pipeline_cfg = CONFIG_FILE
     output:
         features = f"{PROJECTION_OUTPUT}/avg_features.npy",
@@ -358,6 +385,13 @@ rule ortho_projection:
                 {CROP_SCALE[0]} \
                 {CROP_SCALE[1]} \
                 {CROP_SCALE[2]} \
+            --n-side {PROJ_N_SIDE} \
+            --side-elevations {PROJ_SIDE_ELEVATIONS} \
+            --n-top-ring {PROJ_N_TOP_RING} \
+            --top-elevations {PROJ_TOP_ELEVATIONS} \
+            --azimuth-offset {PROJ_AZIMUTH_OFFSET} \
+            --dist-factor {PROJ_DIST_FACTOR} \
+            --resolution {PROJ_RESOLUTION} \
             --output-dir {PROJECTION_OUTPUT}
         """
 
@@ -386,7 +420,9 @@ rule clustering:
             --input-dir {PROJECTION_OUTPUT} \
             --output-dir {CLUSTER_DIR} \
             --n-trials {CLUSTER_N_TRIALS} \
-            --sample-size {CLUSTER_SAMPLE_SIZE}
+            --sample-size {CLUSTER_SAMPLE_SIZE} \
+            --min-clusters {CLUSTER_MIN_CLUSTERS} \
+            --max-clusters {CLUSTER_MAX_CLUSTERS}
         """
 
 
@@ -419,7 +455,15 @@ rule cluster_pair_evidence:
             --config "$GARFIELD_CONFIG" \
             --sam-cache {SAM_CACHE} \
             --output {output.evidence} \
-            --min-cluster-fraction {MIN_CLUSTER_FRACTION}
+            --min-cluster-fraction {MIN_CLUSTER_FRACTION} \
+            --crop-center \
+                {CROP_CENTER[0]} \
+                {CROP_CENTER[1]} \
+                {CROP_CENTER[2]} \
+            --max-elevation-deg {MERGE_MAX_ELEVATION} \
+            --max-incidence-deg {MERGE_MAX_INCIDENCE} \
+            --max-offaxis-deg {MERGE_MAX_OFFAXIS} \
+            --facade-azimuths {MERGE_FACADE_AZIMUTHS}
         """
 
 
@@ -495,7 +539,6 @@ rule render_views:
     input:
         gauss_done = GAUSS_DONE,
         gauss_config_txt = GAUSS_CONFIG_TXT,
-        poses = TRAINING_POSES,
         pipeline_cfg = CONFIG_FILE
     output:
         params = f"{VIEWS_DIR}/view_params.json"
@@ -570,14 +613,14 @@ rule sam3_inference:
              source activate {HPC_CONDA_ENV}; \
              set -u; \
              cd {HPC_WORK}/sam3_repo; \
-             srun -t 02:00:00 \
+             srun -t {HPC_TIME_LIMIT} \
                  -N1 \
                  -n1 \
-                 --cpus-per-task=64 \
-                 --gres=gpu:1 \
+                 --cpus-per-task={HPC_CPUS} \
+                 --gres=gpu:{HPC_GPUS} \
                  -p {HPC_PARTITION} \
                  -A {HPC_ACCOUNT} \
-                 python {HPC_WORK}/run_sam3_finetuned_pcs.py \
+                 python -u {HPC_WORK}/run_sam3_finetuned_pcs.py \
                  --config-yaml {HPC_WORK}/pipeline_config.yaml"
 
         echo "Downloading masks..."

@@ -21,11 +21,11 @@ def run_hdbscan(features, min_cluster_size, min_samples, epsilon):
     return clusterer.fit(features).labels_
 
 
-def objective_score(features, labels):
+def objective_score(features, labels, min_clusters=50, max_clusters=120):
     n_clusters = int(labels.max() + 1)
     noise_pct = 100.0 * float((labels == -1).sum()) / len(labels)
 
-    if n_clusters < 50 or n_clusters > 120:
+    if n_clusters < min_clusters or n_clusters > max_clusters:
         return -9999.0, n_clusters, noise_pct
 
     valid = labels >= 0
@@ -78,8 +78,19 @@ def main():
     parser.add_argument("--n-trials", type=int, default=40)
     parser.add_argument("--sample-size", type=int, default=50000)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--min-clusters", type=int, default=50,
+                        help="Reject trials that produce fewer clusters than this")
+    parser.add_argument("--max-clusters", type=int, default=120,
+                        help="Reject trials that produce more clusters than this")
 
     args = parser.parse_args()
+
+    if args.min_clusters > args.max_clusters:
+        parser.error(
+            f"--min-clusters ({args.min_clusters}) is larger than "
+            f"--max-clusters ({args.max_clusters}); every trial would be rejected"
+        )
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     print("Loading features...")
@@ -96,6 +107,7 @@ def main():
 
     print(f"Using sample size: {n_sample}")
     print(f"Running Optuna trials: {args.n_trials}")
+    print(f"Accepted cluster count: {args.min_clusters} to {args.max_clusters}")
 
     trial_records = []
 
@@ -119,7 +131,8 @@ def main():
             )
 
             score, n_clusters, noise_pct = objective_score(
-                features_sample, labels
+                features_sample, labels,
+                args.min_clusters, args.max_clusters
             )
 
         except Exception as e:
@@ -158,6 +171,14 @@ def main():
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=args.n_trials)
 
+    if study.best_value <= -9999.0:
+        raise SystemExit(
+            f"No trial produced between {args.min_clusters} and "
+            f"{args.max_clusters} clusters. Widen the range in "
+            f"clustering.optimization_min_clusters / "
+            f"optimization_max_clusters, or raise --n-trials."
+        )
+
     best_params = study.best_params
 
     print("\nBest parameters:")
@@ -172,8 +193,16 @@ def main():
     )
 
     final_score, final_n_clusters, final_noise_pct = objective_score(
-        features, final_labels
+        features, final_labels,
+        args.min_clusters, args.max_clusters
     )
+
+    if final_score <= -9999.0:
+        print(
+            f"  Note: the full cloud gave {final_n_clusters} clusters, "
+            f"outside the {args.min_clusters}-{args.max_clusters} range tuned "
+            f"on the sample. The labels are still saved."
+        )
 
     np.save(args.output_dir / "cluster_labels.npy", final_labels)
     np.save(args.output_dir / "best_labels.npy", final_labels)
@@ -196,6 +225,8 @@ def main():
         "method": "optuna_tpe_hdbscan",
         "n_trials": args.n_trials,
         "sample_size": int(n_sample),
+        "min_clusters": int(args.min_clusters),
+        "max_clusters": int(args.max_clusters),
         "best_params": best_params,
         "final_metrics": {
             "score": float(final_score),

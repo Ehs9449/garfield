@@ -26,6 +26,87 @@ from nerfstudio.utils.eval_utils import eval_setup
 from nerfstudio.cameras.cameras import Cameras
 
 
+def fit_radius(bbox_min, bbox_max, fx, fy, cx, cy, margin=1.15):
+    """Camera distance from the building centre so the whole crop box fits.
+
+    Uses the narrower of the two half field-of-view angles, so the building
+    fits in both image directions.
+    """
+    extent = np.asarray(bbox_max, dtype=np.float32) - np.asarray(bbox_min, dtype=np.float32)
+    half_diag = 0.5 * float(np.linalg.norm(extent))
+
+    half_fov_x = np.arctan(cx / fx)
+    half_fov_y = np.arctan(cy / fy)
+    half_fov = float(min(half_fov_x, half_fov_y))
+
+    return margin * half_diag / np.tan(half_fov)
+
+
+def build_rings(cfg_views):
+    """Return a list of {elevation, n_azimuth} rings.
+
+    Preferred form in config.yaml:
+
+        labeling_views:
+          rings:
+            - {elevation: 5,  n_azimuth: 16}
+            - {elevation: 20, n_azimuth: 16}
+            - {elevation: 40, n_azimuth: 12}
+
+    Falls back to the older low/mid keys so existing configs keep working.
+    """
+    rings = cfg_views.get("rings")
+
+    if rings:
+        return [
+            {
+                "elevation": float(r["elevation"]),
+                "n_azimuth": int(r["n_azimuth"]),
+            }
+            for r in rings
+            if int(r["n_azimuth"]) > 0
+        ]
+
+    rings = []
+
+    n_low = int(cfg_views.get("n_azimuth_low", 0))
+    if n_low > 0:
+        rings.append({
+            "elevation": float(cfg_views.get("low_elevation", 15)),
+            "n_azimuth": n_low,
+        })
+
+    n_mid = int(cfg_views.get("n_azimuth_mid", 0))
+    if n_mid > 0:
+        rings.append({
+            "elevation": float(cfg_views.get("mid_elevation", 45)),
+            "n_azimuth": n_mid,
+        })
+
+    return rings
+
+
+def ring_camera_positions(center, radius, elevation_deg, n_azimuth, azimuth_offset=0.0):
+    """Camera positions on one horizontal ring around the building centre."""
+    center = np.asarray(center, dtype=np.float32)
+    el = np.radians(float(elevation_deg))
+
+    positions = []
+    for k in range(int(n_azimuth)):
+        az_deg = (azimuth_offset + 360.0 * k / float(n_azimuth)) % 360.0
+        az = np.radians(az_deg)
+
+        direction = np.array([
+            np.cos(el) * np.cos(az),
+            np.cos(el) * np.sin(az),
+            np.sin(el),
+        ], dtype=np.float32)
+
+        positions.append((center + radius * direction, az_deg, float(elevation_deg)))
+
+    return positions
+
+
 def build_c2w_matrix(position, centroid):
     """Build camera-to-world matrix looking at centroid from position."""
     position = np.array(position, dtype=np.float32)
@@ -64,26 +145,39 @@ def main():
     args = parser.parse_args()
     with open(args.config_yaml, "r") as f:
         cfg = yaml.safe_load(f)
-    n_low = int(cfg["labeling_views"]["n_azimuth_low"])
-    n_mid = int(cfg["labeling_views"]["n_azimuth_mid"])
-    n_top = int(cfg["labeling_views"]["n_top"])
+    cfg_views = cfg["labeling_views"]
 
-    building_radius = float(cfg["labeling_views"].get("building_radius", 0.7))
-    low_elevation = float(cfg["labeling_views"].get("low_elevation", 15))
-    mid_elevation = float(cfg["labeling_views"].get("mid_elevation", 45))
-    top_elevation = float(cfg["labeling_views"].get("top_elevation", 85))
-
-    patch_test_center = np.array(cfg["labeling_views"]["patch_test_center"], dtype=np.float32)
-    patch_test_radius = float(cfg["labeling_views"]["patch_test_radius"])
+    rings = build_rings(cfg_views)
+    n_top = int(cfg_views.get("n_top", 1))
+    top_elevation = float(cfg_views.get("top_elevation", 89))
+    azimuth_offset = float(cfg_views.get("azimuth_offset", 0.0))
+    radius_factor = float(cfg_views.get("radius_factor", 1.15))
+    forced_radius = cfg_views.get("building_radius", None)
 
     building_center = np.array(
         cfg["garfield"].get("crop_center", [0.02, -0.05, -0.15]),
         dtype=np.float32
     )
+    building_scale = np.array(
+        cfg["garfield"].get("crop_scale", [1.0, 0.91, 0.19]),
+        dtype=np.float32
+    )
+
+    bbox_min = building_center - building_scale / 2
+    bbox_max = building_center + building_scale / 2
 
     output_dir = args.output_dir
 
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Remove images from earlier runs. Otherwise old views stay in the
+    # folder, get uploaded to the HPC, and SAM3 spends its time on views
+    # that view_params.json no longer mentions.
+    stale = sorted(output_dir.glob("*.jpg"))
+    for old in stale:
+        old.unlink()
+    if stale:
+        print(f"Removed {len(stale)} image(s) from a previous run")
 
     # Load model
     print("Loading Gaussian Splatting model...")
@@ -92,9 +186,9 @@ def main():
     config, pipeline, checkpoint_path, step = eval_setup(args.config, test_mode='test')
     pipeline.eval()
 
-    # Enable crop
-    crop_center = torch.tensor([0.02, -0.05, -0.15], device=pipeline.device)
-    crop_scale = torch.tensor([1.0, 0.91, 0.19], device=pipeline.device)
+    # Enable crop (from config, not hard-coded)
+    crop_center = torch.tensor(building_center.tolist(), device=pipeline.device)
+    crop_scale = torch.tensor(building_scale.tolist(), device=pipeline.device)
     pipeline.model.crop_enabled = True
     pipeline.model.crop_min = crop_center - crop_scale / 2
     pipeline.model.crop_max = crop_center + crop_scale / 2
@@ -111,45 +205,53 @@ def main():
     os.chdir(original_cwd)
     print(f"✓ Model loaded. Camera: {img_w}x{img_h}")
 
-    # COLMAP/Nerfstudio-guided viewpoints
-    training_poses = np.load("outputs/towerlsu/training_camera_poses.npy")
-
-    # Sample across the entire acquisition path so low, middle, and high views are preserved.
-    n_guided_views = min(96, len(training_poses))
-    selected_indices = np.linspace(
-        0, len(training_poses) - 1, n_guided_views, dtype=int
-    )
+    # ------------------------------------------------------------
+    # Ring viewpoints around the building
+    #
+    # Cameras sit on horizontal rings at several elevations and always
+    # look at the building centre. This replaces the old COLMAP-guided
+    # poses, which were oblique drone shots at uneven angles.
+    # ------------------------------------------------------------
+    if forced_radius is not None:
+        radius = float(forced_radius)
+        print(f"Using fixed camera radius from config: {radius:.3f}")
+    else:
+        radius = fit_radius(bbox_min, bbox_max, fx, fy, cx, cy, margin=radius_factor)
+        print(f"Computed camera radius so the building fits the image: {radius:.3f}")
 
     views = []
-    for j, pose_idx in enumerate(selected_indices):
-        c2w = training_poses[pose_idx].astype(np.float32).copy()
 
-        # Small deterministic perturbation so the rendered pose differs slightly
-        # from the original training camera while preserving its useful viewpoint.
-        yaw_deg = 3.0 if j % 2 == 0 else -3.0
-        yaw = np.radians(yaw_deg)
+    for ring in rings:
+        for position, az_deg, el_deg in ring_camera_positions(
+            building_center,
+            radius,
+            ring["elevation"],
+            ring["n_azimuth"],
+            azimuth_offset,
+        ):
+            views.append({
+                "c2w": build_c2w_matrix(position, building_center),
+                "type": "ring",
+                "azimuth": az_deg,
+                "elevation": el_deg,
+            })
 
-        yaw_local = np.array([
-            [ np.cos(yaw), 0.0, np.sin(yaw)],
-            [ 0.0,         1.0, 0.0        ],
-            [-np.sin(yaw), 0.0, np.cos(yaw)]
-        ], dtype=np.float32)
-
-        c2w[:, :3] = c2w[:, :3] @ yaw_local
-
-        # Tiny position offset along the camera-right direction.
-        offset = 0.008 if j % 2 == 0 else -0.008
-        c2w[:, 3] += offset * c2w[:, 0]
+    # Top-down views for the roof.
+    for k in range(n_top):
+        az_deg = (azimuth_offset + 360.0 * k / max(n_top, 1)) % 360.0
+        position = ring_camera_positions(
+            building_center, radius, top_elevation, 1, az_deg
+        )[0][0]
 
         views.append({
-            "pose_index": int(pose_idx),
-            "c2w": c2w,
-            "type": "colmap_guided",
-            "azimuth": 0,
-            "elevation": 0,
+            "c2w": build_c2w_matrix(position, building_center),
+            "type": "top",
+            "azimuth": az_deg,
+            "elevation": top_elevation,
         })
 
-    print(f"Rendering {len(views)} COLMAP-guided views...")
+    print(f"Rendering {len(views)} ring views "
+          f"({len(rings)} rings + {n_top} top view(s))...")
 
     all_view_params = []
 

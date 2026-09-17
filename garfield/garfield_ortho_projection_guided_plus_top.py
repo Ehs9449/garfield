@@ -112,7 +112,8 @@ class GarfieldOrthoProjector:
             vv.unsqueeze(-1) * up_vec.unsqueeze(0).unsqueeze(0)
         )
 
-        directions = look_dir.unsqueeze(0).unsqueeze(0).expand(img_width, img_height, -1)
+        # origins is [img_height, img_width, 3]; directions must match it.
+        directions = look_dir.unsqueeze(0).unsqueeze(0).expand(img_height, img_width, -1)
 
         num_rays = img_width * img_height
         origins = origins.reshape(num_rays, 3)
@@ -219,8 +220,75 @@ class GarfieldOrthoProjector:
 
         return px, py, proj_depth
 
+    @staticmethod
+    def _make_ortho_view(name, center, azimuth_deg, elevation_deg,
+                         cam_dist, bbox_corners, padding):
+        """Build one orthographic view that looks at the building centre.
+
+        azimuth_deg is measured around +Z from the +X axis.
+        elevation_deg is 0 for a horizontal (facade) view and 90 for top-down.
+        """
+        center = np.asarray(center, dtype=np.float32)
+
+        az = np.radians(float(azimuth_deg))
+        el = np.radians(float(elevation_deg))
+
+        # Unit vector from the building centre out to the camera.
+        offset = np.array([
+            np.cos(el) * np.cos(az),
+            np.cos(el) * np.sin(az),
+            np.sin(el),
+        ], dtype=np.float32)
+
+        plane_center = center + cam_dist * offset
+        look_dir = -offset
+
+        world_up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        right = np.cross(look_dir, world_up)
+
+        if np.linalg.norm(right) < 1e-6:
+            right = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+
+        right = right / (np.linalg.norm(right) + 1e-8)
+        up = np.cross(right, look_dir)
+        up = up / (np.linalg.norm(up) + 1e-8)
+
+        relative = bbox_corners - plane_center
+        projected_right = relative @ right
+        projected_up = relative @ up
+
+        view_width = (projected_right.max() - projected_right.min()) * padding
+        view_height = (projected_up.max() - projected_up.min()) * padding
+
+        return {
+            'name': name,
+            'plane_center': plane_center.tolist(),
+            'look_dir': look_dir.tolist(),
+            'up_vec': up.tolist(),
+            'view_width': float(view_width),
+            'view_height': float(view_height),
+        }
+
+    @staticmethod
+    def _view_resolution(view_width, view_height, long_side):
+        """Pick pixel dimensions that keep pixels close to square."""
+        aspect = float(view_height) / max(float(view_width), 1e-8)
+
+        if aspect <= 1.0:
+            img_w = int(long_side)
+            img_h = max(64, int(round(long_side * aspect)))
+        else:
+            img_h = int(long_side)
+            img_w = max(64, int(round(long_side / aspect)))
+
+        return img_w, img_h
+
     def run_pipeline(self, pointcloud_path, scale, output_dir,
-                     img_resolution=1080):
+                     img_resolution=1080,
+                     n_side=4, side_elevations=(0.0,),
+                     n_top_ring=4, top_elevations=(80.0,),
+                     azimuth_offset=0.0, dist_factor=1.5,
+                     square_pixels=True, strict_depth=True):
         """
         Full pipeline:
         1. Render orthographic feature maps from multiple views
@@ -295,18 +363,6 @@ class GarfieldOrthoProjector:
         print(f"  Crop scale:  [{sx}, {sy}, {sz}]")
         print(f"  BBox: {bbox_min} to {bbox_max}")
 
-        views = []
-
-        # Use the same COLMAP/Nerfstudio camera trajectory that produced
-        # the successful perspective labeling views, but keep rendering
-        # fully orthographic.
-        training_poses = np.load("outputs/towerlsu/training_camera_poses.npy")
-
-        n_guided_views = min(96, len(training_poses))
-        selected_indices = np.linspace(
-            0, len(training_poses) - 1, n_guided_views, dtype=int
-        )
-
         # Eight corners of the building crop box.
         bbox_corners = np.array([
             [x, y, z]
@@ -315,63 +371,36 @@ class GarfieldOrthoProjector:
             for z in [bbox_min[2], bbox_max[2]]
         ], dtype=np.float32)
 
-        for j, pose_idx in enumerate(selected_indices):
-            c2w = training_poses[pose_idx].astype(np.float32).copy()
+        # Distance from the building centre to the orthographic image plane.
+        half_diag = 0.5 * float(np.linalg.norm(np.array([sx, sy, sz])))
+        cam_dist = half_diag * dist_factor
 
-            # Same small perturbation used by the successful guided RGB renderer.
-            yaw_deg = 3.0 if j % 2 == 0 else -3.0
-            yaw = np.radians(yaw_deg)
-
-            yaw_local = np.array([
-                [ np.cos(yaw), 0.0, np.sin(yaw)],
-                [ 0.0,         1.0, 0.0        ],
-                [-np.sin(yaw), 0.0, np.cos(yaw)]
-            ], dtype=np.float32)
-
-            c2w[:, :3] = c2w[:, :3] @ yaw_local
-
-            offset = 0.008 if j % 2 == 0 else -0.008
-            c2w[:, 3] += offset * c2w[:, 0]
-
-            plane_center = c2w[:, 3]
-            right = c2w[:, 0]
-            up = c2w[:, 1]
-
-            # Nerfstudio/OpenGL cameras look along local -Z.
-            look_dir = -c2w[:, 2]
-
-            # Determine an orthographic field of view large enough to contain
-            # the crop box from this camera orientation.
-            relative = bbox_corners - plane_center
-            projected_right = relative @ right
-            projected_up = relative @ up
-
-            view_width = (
-                projected_right.max() - projected_right.min()
-            ) * padding
-
-            view_height = (
-                projected_up.max() - projected_up.min()
-            ) * padding
-
-            views.append({
-                'name': f'guided_{j:03d}_pose{int(pose_idx):04d}',
-                'plane_center': plane_center.tolist(),
-                'look_dir': look_dir.tolist(),
-                'up_vec': up.tolist(),
-                'view_width': float(view_width),
-                'view_height': float(view_height),
-            })
-
+        views = []
 
         # ------------------------------------------------------------
-        # Additional synthetic orthographic views for roof/top coverage
-        # Keep the original 96 COLMAP-guided facade views unchanged.
+        # Side views: the camera looks horizontally straight at the
+        # facade. Oblique drone poses smear features across depth, so
+        # the facade-facing directions are used instead.
         # ------------------------------------------------------------
+        for el_deg in side_elevations:
+            for k in range(n_side):
+                az_deg = (azimuth_offset + 360.0 * k / float(n_side)) % 360.0
 
-        # Roof coverage: one true top-down view plus four near-top views.
+                views.append(self._make_ortho_view(
+                    name=f"side_az{int(round(az_deg)):03d}_el{int(round(el_deg)):02d}",
+                    center=center,
+                    azimuth_deg=az_deg,
+                    elevation_deg=el_deg,
+                    cam_dist=cam_dist,
+                    bbox_corners=bbox_corners,
+                    padding=padding,
+                ))
+
+        # ------------------------------------------------------------
+        # Top views for the roof.
+        # ------------------------------------------------------------
         top_center = np.array(
-            [cx, cy, bbox_max[2] + max_extent * 0.8],
+            [cx, cy, cz + cam_dist],
             dtype=np.float32
         )
 
@@ -384,52 +413,25 @@ class GarfieldOrthoProjector:
             'view_height': float(sy * padding),
         })
 
-        # Four very steep roof views at 80-degree elevation.
-        elevation = np.radians(80.0)
-        horizontal_dist = max_extent * 0.25
-        vertical_dist = horizontal_dist * np.tan(elevation)
+        for el_deg in top_elevations:
+            for k in range(n_top_ring):
+                az_deg = (azimuth_offset + 360.0 * k / float(n_top_ring)) % 360.0
 
-        for azimuth_deg in [0, 90, 180, 270]:
-            azimuth = np.radians(azimuth_deg)
+                views.append(self._make_ortho_view(
+                    name=f"roof_az{int(round(az_deg)):03d}_el{int(round(el_deg)):02d}",
+                    center=center,
+                    azimuth_deg=az_deg,
+                    elevation_deg=el_deg,
+                    cam_dist=cam_dist,
+                    bbox_corners=bbox_corners,
+                    padding=padding,
+                ))
 
-            plane_center = np.array([
-                cx + horizontal_dist * np.cos(azimuth),
-                cy + horizontal_dist * np.sin(azimuth),
-                cz + vertical_dist,
-            ], dtype=np.float32)
-
-            look_dir = center - plane_center
-            look_dir = look_dir / np.linalg.norm(look_dir)
-
-            world_up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-            right = np.cross(look_dir, world_up)
-            right = right / (np.linalg.norm(right) + 1e-8)
-            up = np.cross(right, look_dir)
-            up = up / (np.linalg.norm(up) + 1e-8)
-
-            relative = bbox_corners - plane_center
-            projected_right = relative @ right
-            projected_up = relative @ up
-
-            view_width = (
-                projected_right.max() - projected_right.min()
-            ) * padding
-            view_height = (
-                projected_up.max() - projected_up.min()
-            ) * padding
-
-            views.append({
-                'name': f'roof80_{azimuth_deg:03d}',
-                'plane_center': plane_center.tolist(),
-                'look_dir': look_dir.tolist(),
-                'up_vec': up.tolist(),
-                'view_width': float(view_width),
-                'view_height': float(view_height),
-            })
-
-        print(f"  Generated {len(views)} COLMAP-guided orthographic views")
-        print("  Camera positions/orientations follow the training trajectory")
-        print("  Projection remains fully orthographic")
+        print(f"  Generated {len(views)} orthographic views")
+        print(f"    side: {n_side} azimuths x {len(side_elevations)} elevation(s) "
+              f"{side_elevations}")
+        print(f"    top:  1 top-down + {n_top_ring} x {len(top_elevations)} roof view(s)")
+        print(f"    camera distance from centre: {cam_dist:.3f}")
 
         ############################################################
         # STEP 3: Render features and project points for each view
@@ -444,10 +446,21 @@ class GarfieldOrthoProjector:
         print(f"  Saving rendered views to: {views_dir}")
 
         near_clip = 0.01
-        far_clip = max_extent * 2.5
+        # The image plane sits cam_dist from the centre, so the far side of
+        # the building is at cam_dist + half_diag. Keep a margin on top.
+        far_clip = float(cam_dist + 2.0 * half_diag)
+
+        view_stats = []
 
         for view_idx, view in enumerate(views):
             print(f"\n--- View {view_idx + 1}/{len(views)}: {view['name']} ---")
+
+            if square_pixels:
+                img_w, img_h = self._view_resolution(
+                    view['view_width'], view['view_height'], img_resolution
+                )
+            else:
+                img_w, img_h = img_resolution, img_resolution
 
             # Render orthographic feature map
             start_time = time.time()
@@ -457,8 +470,8 @@ class GarfieldOrthoProjector:
                 up_vec=view['up_vec'],
                 width=view['view_width'],
                 height=view['view_height'],
-                img_width=img_resolution,
-                img_height=img_resolution,
+                img_width=img_w,
+                img_height=img_h,
                 near=near_clip,
                 far=far_clip,
                 scale=scale,
@@ -513,15 +526,23 @@ class GarfieldOrthoProjector:
 
             if depth is not None:
                 rendered_depth_at_points = depth[valid_py, valid_px]
-                # Point is visible if its depth is close to the rendered surface depth
-                # Use relative tolerance (20% of rendered depth)
-                depth_tolerance = 0.2 * np.abs(rendered_depth_at_points)
-                depth_tolerance = np.maximum(depth_tolerance, 0.05)  # min absolute tolerance
+                # A point is visible when its depth matches the rendered
+                # surface depth. The tolerance is a small fraction of the
+                # building size, not of the (large) camera distance.
+                depth_tolerance = np.full(
+                    len(rendered_depth_at_points),
+                    max(0.02 * half_diag, 1e-4),
+                    dtype=np.float32,
+                )
                 depth_diff = np.abs(valid_proj_depth - rendered_depth_at_points)
                 visible = depth_diff < depth_tolerance
 
-                # If very few pass depth check, skip it (rely on multi-view averaging)
                 if visible.sum() < 100 and valid.sum() > 100:
+                    if strict_depth:
+                        # Falling back to all in-bounds points would give the
+                        # far facade the features of the near facade.
+                        print(f"  Only {visible.sum()} points pass the depth check, skipping view")
+                        continue
                     print(f"  Depth check too strict ({visible.sum()} visible), using all {valid.sum()} in-bounds points")
                     visible = np.ones(valid.sum(), dtype=bool)
             else:
@@ -541,9 +562,22 @@ class GarfieldOrthoProjector:
             feature_sum[visible_indices] += looked_up_features
             feature_count[visible_indices] += 1
 
-            n_visible = visible.sum()
+            n_visible = int(visible.sum())
             print(f"  Visible points: {n_visible} ({100 * n_visible / N_points:.1f}%)")
             print(f"  Saved: {rgb_path.name}, {pca_path.name}")
+
+            view_stats.append({
+                'name': view['name'],
+                'visible_points': n_visible,
+                'visible_pct': round(100.0 * n_visible / N_points, 2),
+                'img_width': int(img_w),
+                'img_height': int(img_h),
+                'view_width': float(view['view_width']),
+                'view_height': float(view['view_height']),
+                'render_seconds': round(float(render_time), 2),
+                'plane_center': [float(v) for v in view['plane_center']],
+                'look_dir': [float(v) for v in view['look_dir']],
+            })
 
         ############################################################
         # STEP 4: Average features across views
@@ -583,6 +617,33 @@ class GarfieldOrthoProjector:
         if colors is not None:
             np.save(output_dir / "colors.npy", colors)
         np.save(output_dir / "feature_count.npy", feature_count)
+
+        # Per-view report, read by the control panel.
+        side = sum(v['visible_points'] for v in view_stats
+                   if v['name'].startswith('side'))
+        top = sum(v['visible_points'] for v in view_stats
+                  if not v['name'].startswith('side'))
+        total_samples = side + top
+
+        with open(output_dir / "view_stats.json", "w") as f:
+            json.dump({
+                'scale': float(scale),
+                'n_side': int(n_side),
+                'side_elevations': [float(e) for e in side_elevations],
+                'n_top_ring': int(n_top_ring),
+                'top_elevations': [float(e) for e in top_elevations],
+                'cam_dist': float(cam_dist),
+                'n_points': int(N_points),
+                'points_with_features': int(has_features.sum()),
+                'side_samples': int(side),
+                'top_samples': int(top),
+                'side_share_pct': round(100.0 * side / total_samples, 2)
+                if total_samples else 0.0,
+                'views': view_stats,
+            }, f, indent=2)
+
+        print(f"  Side views contributed {100.0 * side / total_samples:.1f}% "
+              f"of all feature samples" if total_samples else "")
         print(f"  ✓ Saved features to {output_dir}/avg_features.npy")
         print(f"  ✓ To re-cluster without re-rendering, use --load-features flag")
 
@@ -738,7 +799,23 @@ def main():
                         metavar=("SX", "SY", "SZ"),
                         help="Crop box size as SX SY SZ")
     parser.add_argument("--resolution", type=int, default=1080,
-                        help="Image resolution for rendering")
+                        help="Pixels on the long side of each rendered view")
+    parser.add_argument("--n-side", type=int, default=4,
+                        help="Number of horizontal (facade) views around the building")
+    parser.add_argument("--side-elevations", type=float, nargs="+", default=[0.0],
+                        help="Elevation angles in degrees for the side views (0 = horizontal)")
+    parser.add_argument("--n-top-ring", type=int, default=4,
+                        help="Number of steep roof views")
+    parser.add_argument("--top-elevations", type=float, nargs="+", default=[80.0],
+                        help="Elevation angles in degrees for the roof views")
+    parser.add_argument("--azimuth-offset", type=float, default=0.0,
+                        help="Rotate all azimuths, e.g. to align views with the real facades")
+    parser.add_argument("--dist-factor", type=float, default=1.5,
+                        help="Image-plane distance as a multiple of the crop box half-diagonal")
+    parser.add_argument("--no-square-pixels", action="store_true",
+                        help="Render every view at resolution x resolution instead of keeping square pixels")
+    parser.add_argument("--allow-depth-fallback", action="store_true",
+                        help="If the depth check rejects almost everything, use all in-bounds points anyway")
     parser.add_argument("--load-features", action="store_true",
                         help="Skip rendering, load saved features from output-dir and re-cluster")
 
@@ -770,6 +847,14 @@ def main():
             scale=args.scale,
             output_dir=args.output_dir,
             img_resolution=args.resolution,
+            n_side=args.n_side,
+            side_elevations=tuple(args.side_elevations),
+            n_top_ring=args.n_top_ring,
+            top_elevations=tuple(args.top_elevations),
+            azimuth_offset=args.azimuth_offset,
+            dist_factor=args.dist_factor,
+            square_pixels=not args.no_square_pixels,
+            strict_depth=not args.allow_depth_fallback,
         )
 
 

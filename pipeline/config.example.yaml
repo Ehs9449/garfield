@@ -35,7 +35,18 @@ projection:
   pointcloud: "exports/garfield_pc/point_cloud.ply"
   scale: 0.05
   output_dir: "outputs/ortho_projection_s005"
-  n_views: 37
+
+  # Facade (side) views: horizontal cameras looking straight at the building.
+  n_side: 4               # azimuth steps; 4 = the four facades, 8/12 adds corners
+  side_elevations: [0.0]  # degrees; 0 = horizontal. Add e.g. 20 for a second ring
+  azimuth_offset: 0.0     # rotate all azimuths to line up with the real facades
+
+  # Roof views
+  n_top_ring: 4           # steep views around the roof (plus one true top-down)
+  top_elevations: [80.0]
+
+  dist_factor: 1.5        # image plane distance / crop box half-diagonal
+  resolution: 1080        # pixels on the long side of each view
 
 # ============================================================
 # Clustering
@@ -43,9 +54,12 @@ projection:
 clustering:
   n_trials: 40
   sample_size: 50000
-  min_cluster_size: 500
-  min_samples: 10
-  cluster_selection_epsilon: 0.0
+
+  # Optuna rejects any trial outside this cluster count.
+  # Keep it high to favour fine / oversegmented clusters, which the
+  # merging stage can then join back together.
+  optimization_min_clusters: 50
+  optimization_max_clusters: 120
 
 # ============================================================
 # Labeling Views
@@ -53,14 +67,19 @@ clustering:
 labeling_views:
   output_dir: "outputs/labeling_views"
 
-  n_azimuth_low: 12        # views at low elevation
-  n_azimuth_mid: 8        # views at mid elevation
-  n_top: 1                # top-down views
+  # Rings of cameras around the building, one entry per elevation level.
+  rings:
+    - {elevation: 5,  n_azimuth: 16}
+    - {elevation: 20, n_azimuth: 16}
+    - {elevation: 40, n_azimuth: 12}
+    - {elevation: 60, n_azimuth: 8}
 
-  building_radius: 0.7    # camera distance from building center
-  low_elevation: 15       # degrees
-  mid_elevation: 45       # degrees
-  top_elevation: 85       # degrees
+  n_top: 1                # top-down views
+  top_elevation: 89       # degrees
+  azimuth_offset: 0.0     # rotate all rings
+
+  radius_factor: 1.15     # margin around the building in the image
+  # building_radius: 0.7  # uncomment to force a fixed camera distance
 
 # ============================================================
 # SAM 3 Inference
@@ -97,6 +116,22 @@ hpc:
   work_dir: "/path/to/your/hpc/workdir"
   account: "your_hpc_account"
   partition: "gpu"
+
+# ============================================================
+# Cluster merging
+# ============================================================
+merging:
+  output_dir: "outputs/merged_clusters"
+  sam_cache: "/path/to/your/dataset/sam_cache"
+  min_cluster_fraction: 0.50
+  min_support: 50
+  min_cosine: 0.90
+
+  # Only training cameras that face a facade are used as merge evidence.
+  max_elevation_deg: 35     # 0 = horizontal side view, 90 = straight down
+  max_incidence_deg: 30     # angle to the nearest facade normal
+  facade_azimuths: [0, 90, 180, 270]
+  max_offaxis_deg: 40       # camera must point near the building centre
 
 # ============================================================
 # Matching

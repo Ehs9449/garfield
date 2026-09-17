@@ -56,7 +56,114 @@ def parse_args():
         help="Minimum visible-cluster fraction inside the same SAM2 mask",
     )
 
+    parser.add_argument(
+        "--crop-center",
+        type=float,
+        nargs=3,
+        default=[0.02, -0.05, -0.15],
+        metavar=("X", "Y", "Z"),
+        help="Building centre, used to select cameras that face the building",
+    )
+
+    parser.add_argument(
+        "--max-elevation-deg",
+        type=float,
+        default=35.0,
+        help="Keep only cameras that look at the building from at most this "
+             "elevation angle (0 = horizontal side view, 90 = straight down)",
+    )
+
+    parser.add_argument(
+        "--max-incidence-deg",
+        type=float,
+        default=30.0,
+        help="Keep only cameras whose horizontal direction is within this "
+             "angle of a facade normal (see --facade-azimuths)",
+    )
+
+    parser.add_argument(
+        "--facade-azimuths",
+        type=float,
+        nargs="+",
+        default=[0.0, 90.0, 180.0, 270.0],
+        help="Azimuth angles in degrees of the facade view directions",
+    )
+
+    parser.add_argument(
+        "--max-offaxis-deg",
+        type=float,
+        default=40.0,
+        help="Keep only cameras pointing within this angle of the building centre",
+    )
+
+    parser.add_argument(
+        "--no-view-filter",
+        action="store_true",
+        help="Use every training camera, as before",
+    )
+
     return parser.parse_args()
+
+
+def select_side_view_cameras(cams, center, max_elevation_deg,
+                             max_incidence_deg, facade_azimuths,
+                             max_offaxis_deg):
+    """Indices of training cameras that look at the building from the side.
+
+    Oblique and near-nadir drone shots make two different facades fall in
+    the same SAM2 mask, which produces wrong merge evidence. Only cameras
+    that face a facade roughly head-on are kept.
+    """
+    center = np.asarray(center, dtype=np.float32)
+
+    facade_dirs = np.array([
+        [np.cos(np.radians(a)), np.sin(np.radians(a))]
+        for a in facade_azimuths
+    ], dtype=np.float32)
+
+    keep = []
+
+    for i in range(len(cams)):
+        c2w = cams.camera_to_worlds[i].cpu().numpy()
+
+        position = c2w[:3, 3]
+        # Nerfstudio/OpenGL cameras look along local -Z.
+        look = -c2w[:3, 2]
+        look = look / (np.linalg.norm(look) + 1e-8)
+
+        # Elevation of the viewing direction. Looking down gives look_z < 0.
+        elevation = np.degrees(np.arcsin(np.clip(-look[2], -1.0, 1.0)))
+        if elevation > max_elevation_deg:
+            continue
+
+        # Is the camera actually pointing at the building?
+        to_center = center - position
+        norm = np.linalg.norm(to_center)
+        if norm < 1e-8:
+            continue
+        offaxis = np.degrees(np.arccos(
+            np.clip(float(look @ (to_center / norm)), -1.0, 1.0)
+        ))
+        if offaxis > max_offaxis_deg:
+            continue
+
+        # Angle between the horizontal view direction and the nearest facade.
+        horizontal = look[:2]
+        h_norm = np.linalg.norm(horizontal)
+        if h_norm < 1e-8:
+            continue
+        horizontal = horizontal / h_norm
+
+        cosines = facade_dirs @ horizontal
+        incidence = np.degrees(np.arccos(
+            np.clip(float(cosines.max()), -1.0, 1.0)
+        ))
+        if incidence > max_incidence_deg:
+            continue
+
+        keep.append(i)
+
+    return keep
 
 
 def main():
@@ -78,9 +185,34 @@ def main():
 
     cams = pipeline.datamanager.train_dataset.cameras
 
+    if args.no_view_filter:
+        camera_indices = list(range(len(cams)))
+        print(f"Using all {len(camera_indices)} training cameras")
+    else:
+        camera_indices = select_side_view_cameras(
+            cams,
+            args.crop_center,
+            args.max_elevation_deg,
+            args.max_incidence_deg,
+            args.facade_azimuths,
+            args.max_offaxis_deg,
+        )
+        print(
+            f"Side-view cameras: {len(camera_indices)} / {len(cams)} "
+            f"(elevation <= {args.max_elevation_deg}deg, "
+            f"incidence <= {args.max_incidence_deg}deg)"
+        )
+
+        if len(camera_indices) < 10:
+            raise SystemExit(
+                "Too few side-view cameras. Relax --max-elevation-deg / "
+                "--max-incidence-deg, set --facade-azimuths to your real "
+                "facade directions, or pass --no-view-filter."
+            )
+
     pair_views = defaultdict(set)
 
-    for i in range(len(cams)):
+    for n_done, i in enumerate(camera_indices):
         cache = args.sam_cache / f"sam_{i:06d}.npz"
 
         if not cache.exists():
@@ -227,9 +359,9 @@ def main():
 
                         pair_views[pair].add(i)
 
-        if (i + 1) % 100 == 0:
+        if (n_done + 1) % 25 == 0:
             print(
-                f"Processed {i + 1}/{len(cams)} cameras"
+                f"Processed {n_done + 1}/{len(camera_indices)} cameras"
             )
 
     rows = sorted(
