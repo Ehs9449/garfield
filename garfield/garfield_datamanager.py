@@ -233,6 +233,7 @@ class GarfieldDataManager(VanillaDataManager):  # pylint: disable=abstract-metho
         depth: torch.Tensor,
         point: torch.Tensor,
         max_scale: float = 2.0,
+        image_name=None,
     ):
         """
         Calculate the set of groups and their 3D scale for each pixel, and the cdf.
@@ -262,7 +263,7 @@ class GarfieldDataManager(VanillaDataManager):  # pylint: disable=abstract-metho
             return (pixel_level_keys, scale, mask_cdf)
 
         # Calculate SAM masks
-        masks = self.img_group_model((rgb.numpy() * 255).astype(np.uint8))
+        masks = self.img_group_model((rgb.numpy() * 255).astype(np.uint8), image_name=image_name)
 
         # If no masks are found, return dummy data.
         if len(masks) == 0:

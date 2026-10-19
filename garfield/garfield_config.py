@@ -41,7 +41,7 @@ garfield_method = MethodSpecification(
                     num_rays_per_image=256,  # 4096/256 = 16 images per batch
                 ),
                 img_group_model=ImgGroupModelConfig(
-                    model_type="sam2",  
+                    model_type="sam3_precomputed",  
                     sam_model_type="configs/sam2.1/sam2.1_hiera_l.yaml",
                     sam_model_ckpt="/home/eaghae1/sam2/checkpoints/sam2.1_hiera_large.pt",
                     # Can choose out of "sam_fb", "sam_hf", "maskformer"

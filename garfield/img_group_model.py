@@ -18,18 +18,27 @@ from nerfstudio.configs import base_config as cfg
 class ImgGroupModelConfig(cfg.InstantiateConfig):
     _target: Type = field(default_factory=lambda: ImgGroupModel)
     """target class to instantiate"""
-    model_type: Literal["sam_fb", "sam_hf", "maskformer", "sam2"] = "sam2"
+    model_type: Literal[
+        "sam_fb",
+        "sam_hf",
+        "maskformer",
+        "sam2",
+        "sam3_precomputed",
+    ] = "sam3_precomputed"
+    
     """
     Currently supports:
      - "sam_fb": Original SAM model (from facebook github)
      - "sam_hf": SAM model from huggingface
      - "maskformer": MaskFormer model from huggingface (experimental)
+     - "sam3_precomputed": Precomputed fine-tuned SAM3 masks generated on HPC    
     """
 
     sam_model_type: str = "/home/eaghae1/sam2/checkpoints/sam2.1_hiera_l.yaml"
     sam_model_ckpt: str = "/home/eaghae1/sam2/checkpoints/sam2.1_hiera_large.pt"
     sam_finetuned_ckpt: str = "/home/eaghae1/sam2/checkpoints/checkpoint.pt"
     sam_kwargs: dict = field(default_factory=lambda: {})
+    sam3_mask_dir: str = ""
     "Arguments for SAM model (fb)."
 
     # # Settings used for the paper:
@@ -60,9 +69,60 @@ class ImgGroupModel:
         # also, assert that model_type doesn't have a "/" in it! Will mess with h5df.
         assert "/" not in self.config.model_type, "model_type cannot have a '/' in it!"
 
-    def __call__(self, img: np.ndarray):
+    def __call__(self, img: np.ndarray, image_name=None):
         # takes in range 0-255... HxWx3
         # For using huggingface transformer's SAM model
+        if self.config.model_type == "sam3_precomputed":
+
+            if image_name is None:
+                raise ValueError(
+                    "image_name must be provided when using sam3_precomputed"
+                )
+
+            from pathlib import Path
+
+            if not self.config.sam3_mask_dir:
+                raise ValueError(
+                    "sam3_mask_dir has not been configured."
+                )
+
+            mask_dir = Path(self.config.sam3_mask_dir)
+
+            mask_file = (
+                mask_dir
+                / f"{Path(image_name).stem}_masks.npz"
+            )
+
+            if not mask_file.exists():
+                raise FileNotFoundError(
+                    f"SAM3 mask file not found: {mask_file}"
+                )
+
+            data = np.load(
+                mask_file,
+                allow_pickle=True,
+            )
+
+            masks = []
+
+            for key in data.files:
+                if not key.endswith("_masks"):
+                    continue
+
+                prompt_masks = data[key]
+
+                for mask in prompt_masks:
+                    mask = mask.astype(bool)
+
+                    if mask.any():
+                        masks.append(mask)
+
+            masks = sorted(
+                masks,
+                key=lambda x: x.sum(),
+            )
+
+            return masks
         if self.config.model_type == "sam_hf":
             if self.model is None:
                 self.model = pipeline("mask-generation", model="facebook/sam-vit-huge", device=self.device)
