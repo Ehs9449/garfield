@@ -1,0 +1,42 @@
+# Copy to pipeline/config.direct_sam3.yaml and edit.
+inputs:
+  points: /path/to/points.npy
+  camera_path: /path/to/camera_path.json
+  gauss_config_txt: /path/to/garfield_gauss_config.txt
+output:
+  root: outputs/direct_sam3
+# Used for crop settings during rendering only; semantic fusion does not use GARField features.
+garfield:
+  crop_center: [0.0, 0.0, 0.0]
+  crop_scale: [2.0, 2.0, 2.0]
+render:
+  frames: 96
+  width: 1600
+  fov_deg: null
+  crop: true
+sam3:
+  hpc_conda_env: /work/USER/conda_envs/sam3
+  checkpoint: /work/USER/path/to/checkpoint.pt
+  bpe_path: /work/USER/sam3_repo/assets/bpe_simple_vocab_16e6.txt.gz
+  confidence_threshold: 0.30
+  prompts: [window, wall, roof, door, column, beam, ceiling, floor, curtain wall, opening, vegetation, ground, sky, staircase, railing]
+hpc:
+  user: USER
+  host: mike.hpc.lsu.edu
+  work_dir: /work/USER
+  account: YOUR_ACCOUNT
+  partition: gpu
+  cpus_per_task: 8
+  gpus: 1
+  time_limit: 04:00:00
+fusion:
+  min_sam3_score: 0.30
+  min_evidence_views: 2
+  min_point_ratio: 0.15
+  min_weighted_score: 0.12
+  component_min_views: 3
+  component_min_ratio: 0.25
+  component_min_evidence: 0.12
+  zbuffer_tile: 4
+  depth_abs_tolerance: 0.02
+  depth_rel_tolerance: 0.025

@@ -1,0 +1,96 @@
+# ============================================================
+# Direct SAM3 semantic pipeline — convenience wrapper
+# ============================================================
+# NEW WRAPPER: assembled from the validated commands after the experiments.
+# It is NOT a historical Snakefile that produced the reported results.
+# ============================================================
+
+import yaml
+
+CONFIG_FILE = "pipeline/config.direct_sam3.yaml"
+with open(CONFIG_FILE) as f:
+    cfg = yaml.safe_load(f)
+
+POINTS = cfg["inputs"]["points"]
+CAMERA_PATH = cfg["inputs"]["camera_path"]
+GAUSS_CONFIG_TXT = cfg["inputs"]["gauss_config_txt"]
+OUT = cfg["output"]["root"]
+VIEWS = f"{OUT}/views"
+MASKS = f"{OUT}/masks"
+SEMANTIC = f"{OUT}/semantic"
+SAM3_DONE = f"{OUT}/.sam3_done"
+
+FRAMES = cfg["render"].get("frames", 96)
+WIDTH = cfg["render"].get("width", 1600)
+FOV = cfg["render"].get("fov_deg", None)
+CROP = cfg["render"].get("crop", True)
+FOV_ARG = "" if FOV is None else f"--fov-deg {FOV}"
+CROP_ARG = "" if CROP else "--no-crop"
+
+F = cfg.get("fusion", {})
+MIN_SAM3_SCORE = F.get("min_sam3_score", 0.30)
+MIN_EVIDENCE_VIEWS = F.get("min_evidence_views", 2)
+MIN_POINT_RATIO = F.get("min_point_ratio", 0.15)
+MIN_WEIGHTED_SCORE = F.get("min_weighted_score", 0.12)
+COMPONENT_MIN_VIEWS = F.get("component_min_views", 3)
+COMPONENT_MIN_RATIO = F.get("component_min_ratio", 0.25)
+COMPONENT_MIN_EVIDENCE = F.get("component_min_evidence", 0.12)
+ZBUFFER_TILE = F.get("zbuffer_tile", 4)
+DEPTH_ABS_TOL = F.get("depth_abs_tolerance", 0.02)
+DEPTH_REL_TOL = F.get("depth_rel_tolerance", 0.025)
+
+rule all:
+    input:
+        f"{SEMANTIC}/semantic_pointcloud.ply",
+        f"{SEMANTIC}/summary.json"
+
+rule render_views:
+    input:
+        camera_path = CAMERA_PATH,
+        gauss_config = GAUSS_CONFIG_TXT,
+        config = CONFIG_FILE
+    output:
+        params = f"{VIEWS}/view_params.json"
+    shell:
+        r"""
+        python pipeline/scripts/render_camera_path.py \
+          --camera-path {input.camera_path} \
+          --gauss-config-txt {input.gauss_config} \
+          --pipeline-config {CONFIG_FILE} \
+          --output-dir {VIEWS} \
+          --frames {FRAMES} --width {WIDTH} {FOV_ARG} {CROP_ARG} --overwrite
+        """
+
+rule sam3_masks:
+    input:
+        params = f"{VIEWS}/view_params.json",
+        config = CONFIG_FILE
+    output:
+        done = touch(SAM3_DONE)
+    shell:
+        r"""
+        bash pipeline/scripts/run_sam3_hpc_generic.sh \
+          --views {VIEWS} --out {MASKS} --config {CONFIG_FILE} --tag direct_sam3
+        """
+
+rule direct_semantic_fusion:
+    input:
+        points = POINTS,
+        params = f"{VIEWS}/view_params.json",
+        sam3 = SAM3_DONE
+    output:
+        ply = f"{SEMANTIC}/semantic_pointcloud.ply",
+        summary = f"{SEMANTIC}/summary.json"
+    shell:
+        r"""
+        python feature_clustering_experiments/direct_sam3_pftdrone_quick/direct_sam3_pftdrone_quick.py \
+          --points {input.points} --views {VIEWS} --masks {MASKS} --output {SEMANTIC} \
+          --min-sam3-score {MIN_SAM3_SCORE} \
+          --min-evidence-views {MIN_EVIDENCE_VIEWS} \
+          --min-point-ratio {MIN_POINT_RATIO} \
+          --min-weighted-score {MIN_WEIGHTED_SCORE} \
+          --component-min-views {COMPONENT_MIN_VIEWS} \
+          --component-min-ratio {COMPONENT_MIN_RATIO} \
+          --component-min-evidence {COMPONENT_MIN_EVIDENCE} \
+          --tile {ZBUFFER_TILE} --abs-tol {DEPTH_ABS_TOL} --rel-tol {DEPTH_REL_TOL}
+        """
