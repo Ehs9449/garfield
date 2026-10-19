@@ -1,0 +1,142 @@
+dataset:
+  name: towerlsu
+  path: /home/eaghae1/data/towerlsu
+  has_gps: false
+colmap:
+  conda_env: ColmapLnx
+garfield:
+  conda_env: nerfstudio3
+  crop_center:
+  - -0.3
+  - -0.2
+  - 0.0
+  crop_scale:
+  - 2.0
+  - 2.17
+  - 2.38
+projection:
+  pointcloud: exports/point_cloud.ply
+  scale: 0.05
+  output_dir: ortho_projection_guided_plus_top
+  n_side: 4
+  side_elevations:
+  - 0.0
+  azimuth_offset: 0.0
+  n_top_ring: 4
+  top_elevations:
+  - 80.0
+  dist_factor: 1.5
+  resolution: 1080
+clustering:
+  method: spherical_kmeans
+  k: 400
+  seed: 42
+  niter: 25
+  nredo: 2
+  suite_dir: production_v2/clustering
+  prototype_merge:
+    enabled: true
+    cosine_threshold: 0.9
+    output_dir: production_v2/prototype_merge
+labeling_views:
+  output_dir: outputs/labeling_views_colmap_guided
+  rings:
+  - elevation: 5
+    n_azimuth: 16
+  - elevation: 20
+    n_azimuth: 16
+  - elevation: 40
+    n_azimuth: 12
+  - elevation: 60
+    n_azimuth: 8
+  n_top: 1
+  top_elevation: 89
+  azimuth_offset: 0.0
+  radius_factor: 1.15
+semantic_views:
+  baseline_auto_dir: production_v2/semantic_views_auto
+  baseline_masks_dir: production_v2/semantic_masks_auto
+  refinement:
+    mode: custom
+    output_dir: production_v2/semantic_views_refinement
+    masks_dir: production_v2/semantic_masks_refinement
+    camera_path: pipeline/camera_paths/towerlsu.json
+    frames: 96
+    width: 1600
+    fov_deg: null
+    crop: true
+sam3:
+  conda_env: sam3
+  hpc_conda_env: /work/eaghae1/conda_envs/sam3
+  checkpoint: /work/eaghae1/sam3_finetune_hdb/checkpoints/checkpoint.pt
+  bpe_path: /work/eaghae1/sam3_repo/assets/bpe_simple_vocab_16e6.txt.gz
+  confidence_threshold: 0.3
+  garfield_training_images: /home/eaghae1/data/towerlsu/images
+  prompts:
+  - window
+  - wall
+  - roof
+  - door
+  - column
+  - beam
+  - ceiling
+  - floor
+  - curtain wall
+  - opening
+  - vegetation
+  - ground
+  - sky
+  - staircase
+  - railing
+  grouping_prompts:
+  - building
+  - tower
+  - facade
+  - roof
+  - wall
+  - window
+  - door
+  - column
+  - beam
+  - curtain wall
+  - opening
+  - staircase
+  - railing
+hpc:
+  user: eaghae1
+  host: mike.hpc.lsu.edu
+  work_dir: /work/eaghae1
+  account: hpc_rapid_dt
+  partition: gpu
+  cpus_per_task: 8
+  gpus: 1
+  time_limit: 04:00:00
+matching:
+  baseline:
+    output_dir: production_v2/baseline_cluster_semantics
+    min_iou: 0.05
+    min_supporting_views: 1
+    use_sam3_confidence: false
+  pointwise:
+    output_dir: production_v2/pointwise_multiclass
+    min_sam3_score: 0.3
+    min_evidence_views: 2
+    min_point_ratio: 0.15
+    min_weighted_score: 0.12
+    window_erode: 1
+    window_bonus: 1.1
+    zbuffer_tile: 4
+    depth_abs_tolerance: 0.02
+    depth_rel_tolerance: 0.025
+  component_aware:
+    output_dir: production_v2/component_aware
+    min_sam3_score: 0.3
+    min_views: 3
+    min_ratio: 0.25
+    min_views_overrides: ''
+    min_ratio_overrides: ''
+    erosion_overrides: ''
+  architecture_over_sky:
+    enabled: true
+    output_dir: production_v2/final_semantics
+    min_sam3_score: 0.3
