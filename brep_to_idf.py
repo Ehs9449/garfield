@@ -24,17 +24,45 @@ Method
 6.  Columns become shading, using the minimum rotated rectangle of each
     cluster rather than an axis-aligned box.
 
+Fixes in this version
+---------------------
+-   --envelope takes several clouds. Give it the walls AND the roof. With
+    the roof cloud alone there are almost no facade points, so the facade
+    lines were wrong.
+-   Noise removal (statistical outliers + largest DBSCAN cluster). Stray
+    wall/roof points on the ground and in the trees stretched the model.
+-   Ground and top come from percentiles, not min/max, so a few stray
+    points no longer change the scale.
+-   Inside/outside of a plan cell is decided from roof-like points only,
+    and the footprint is closed and hole-filled. Wall points used to mark
+    thin false strips next to every facade.
+-   Roof levels are found by 1D clustering with a gap tolerance, so one
+    roof is one level. Cells lower than --min-height are dropped.
+-   GlobalGeometryRules uses Relative coordinates and the North Axis sign
+    is corrected. With World, EnergyPlus ignored the North Axis.
+-   Column clustering defaults fit this sparse column cloud.
+-   Doors (--doors door.ply): found on ground-floor walls like windows,
+    bottom snapped to the ground, written as FenestrationSurface:Detailed
+    of type Door with an opaque ExtDoor construction.
+-   Openings (--openings opening.ply) use the same rules as doors and are
+    also written as Door. Names end in _Opening_NN.
+-   Where masks overlap on one wall the priority is
+    windows > doors > openings; the lower one is removed.
+
 Usage
 -----
     python brep_to_idf.py \
-        --envelope "roof - Cloud.ply" \
-        --windows  "window - Cloud.ply" \
-        --columns  "column - Cloud.ply" \
+        --envelope wall.ply roof.ply \
+        --windows  window.ply \
+        --columns  column.ply \
+        --doors    door.ply \
+        --openings opening.ply \
         --height 53.0 --out lsu_tower.idf --preview massing.ply
 """
 
 import argparse
 import os
+import warnings
 from collections import defaultdict
 
 import numpy as np
@@ -78,7 +106,9 @@ Timestep, 6;
 GlobalGeometryRules,
     UpperLeftCorner,         !- Starting Vertex Position
     Counterclockwise,        !- Vertex Entry Direction
-    World;                   !- Coordinate System
+    Relative;                !- Coordinate System
+                             !- Relative, so the North Axis above is used.
+                             !- With World, EnergyPlus ignores it.
 
 Site:Location,
     Baton Rouge LA,
@@ -130,6 +160,7 @@ Material, Insulation 80mm, MediumRough, 0.0800, 0.040, 40.0, 1200.0;
 Material, Plaster 15mm, Smooth, 0.0150, 0.160, 600.0, 1000.0;
 Material, Concrete 150mm, MediumRough, 0.1500, 1.730, 2243.0, 837.0;
 Material, Roof Membrane, VeryRough, 0.0095, 0.160, 1121.0, 1460.0;
+Material, Wood Door 50mm, MediumSmooth, 0.0500, 0.150, 600.0, 1630.0;
 
 WindowMaterial:SimpleGlazingSystem,
     Simple Glazing, 2.500, 0.350, 0.700;
@@ -138,6 +169,7 @@ Construction, ExtWall,  Brick 200mm, Insulation 80mm, Plaster 15mm;
 Construction, ExtRoof,  Roof Membrane, Insulation 80mm, Concrete 150mm;
 Construction, ExtFloor, Concrete 150mm;
 Construction, ExtWindow, Simple Glazing;
+Construction, ExtDoor, Wood Door 50mm;
 
 Zone,
     {zone},                  !- Name
@@ -163,6 +195,61 @@ def load_points(path):
     if path is None or not os.path.exists(path):
         return np.zeros((0, 3))
     return np.asarray(o3d.io.read_point_cloud(path).points)
+
+def load_many(paths):
+    """Stack several clouds, e.g. --envelope wall.ply roof.ply."""
+    if not paths:
+        return np.zeros((0, 3))
+    if isinstance(paths, str):
+        paths = [paths]
+    parts = [load_points(p) for p in paths]
+    parts = [p for p in parts if len(p)]
+    return np.vstack(parts) if parts else np.zeros((0, 3))
+
+
+def point_spacing(points, sample=20000):
+    """Median distance to the nearest neighbour, in the cloud's own units."""
+    from scipy.spatial import cKDTree
+    pick = points
+    if len(points) > sample:
+        pick = points[np.random.default_rng(0).choice(len(points), sample,
+                                                      replace=False)]
+    dist, _ = cKDTree(points).query(pick, k=2)
+    return float(np.median(dist[:, 1]))
+
+
+def clean_envelope(points, nb, std_ratio, eps_factor):
+    """Remove the noise that the segmentation leaves around the building.
+
+    The wall and roof clouds hold stray points on the ground, in the trees
+    and far away. Those points stretch the bounding box, the height scale
+    and the arrangement, so the model came out longer than the building.
+    Keep only the largest connected piece of the cloud.
+    """
+    cloud = o3d.geometry.PointCloud()
+    cloud.points = o3d.utility.Vector3dVector(points)
+    cloud, _ = cloud.remove_statistical_outlier(nb_neighbors=nb,
+                                                std_ratio=std_ratio)
+    kept = np.asarray(cloud.points)
+
+    spacing = point_spacing(kept)
+    labels = np.array(cloud.cluster_dbscan(eps=eps_factor * spacing,
+                                           min_points=10,
+                                           print_progress=False))
+    if labels.max() < 0:
+        return kept, spacing
+    sizes = np.bincount(labels[labels >= 0])
+    return kept[labels == int(np.argmax(sizes))], spacing
+
+
+def near_building(points, reference, distance):
+    """Keep the points that lie within `distance` of the clean envelope."""
+    if len(points) == 0:
+        return points
+    from scipy.spatial import cKDTree
+    dist, _ = cKDTree(reference).query(points, k=1)
+    return points[dist <= distance]
+
 
 def read_directions(path):
     if path is None:
@@ -266,8 +353,8 @@ def write_idf(path, surfaces, windows, shades, zone, north, version, name):
         blocks.append(
             "FenestrationSurface:Detailed,\n"
             f"    {window['name']},\n"
-            "    Window,\n"
-            "    ExtWindow,\n"
+            f"    {window.get('kind', 'Window')},\n"
+            f"    {window.get('construction', 'ExtWindow')},\n"
             f"    {window['wall']},\n"
             "    ,                        !- Outside Boundary Condition Object\n"
             "    ,                        !- View Factor to Ground\n"
@@ -291,7 +378,7 @@ def write_preview(path, surfaces, windows, shades):
     """One coloured mesh so the result can be opened next to the cloud."""
     palette = {"Wall": [0.75, 0.75, 0.78], "Roof": [0.85, 0.30, 0.25],
                "Floor": [0.25, 0.35, 0.65], "Window": [0.20, 0.85, 0.95],
-               "Column": [1.00, 0.80, 0.20]}
+               "Column": [1.00, 0.80, 0.20], "Door": [0.45, 0.25, 0.10]}
 
     vertices, triangles, colours = [], [], []
 
@@ -305,7 +392,7 @@ def write_preview(path, surfaces, windows, shades):
     for surface in surfaces:
         add(surface["vertices"], palette[surface["type"]])
     for window in windows:
-        add(window["vertices"], palette["Window"])
+        add(window["vertices"], palette[window.get("kind", "Window")])
     for shade in shades:
         add(shade["vertices"], palette["Column"])
 
@@ -321,6 +408,7 @@ def write_scaled_cloud(path, blocks):
     """The input clouds after rotation and scaling, for side-by-side checks."""
     points, colours = [], []
     palette = {"envelope": [0.85, 0.30, 0.25], "window": [0.20, 0.85, 0.95],
+               "door": [0.45, 0.25, 0.10], "opening": [0.60, 0.20, 0.60],
                "column": [1.00, 0.80, 0.20]}
     for name, data in blocks.items():
         if len(data):
@@ -469,16 +557,29 @@ def arrangement(lines, bounds, margin):
     return faces
 
 
-def occupancy_grid(points, cell, min_hits, percentile):
+def occupancy_grid(points, cell, min_hits, percentile, cover=None,
+                   close_iter=2):
+    """Plan grid of the building footprint.
+
+    points: every shell point, used for the height of each grid cell.
+    cover:  boolean mask of the points that see the sky (roof-like normals).
+            Only these mark a grid cell as inside. Wall points alone would
+            mark a thin strip on both sides of every facade as inside, and
+            those strips became false rooms along the edges of the model.
+    The footprint is closed and its holes are filled, so the top of the
+    tower (a ring of points around the cupola) still counts as inside.
+    """
     x0, y0 = points[:, 0].min(), points[:, 1].min()
     ix = np.floor((points[:, 0] - x0) / cell).astype(int)
     iy = np.floor((points[:, 1] - y0) / cell).astype(int)
     shape = (int(ix.max()) + 1, int(iy.max()) + 1)
 
+    if cover is None:
+        cover = np.ones(len(points), bool)
     counts = np.zeros(shape, dtype=np.int32)
-    np.add.at(counts, (ix, iy), 1)
+    np.add.at(counts, (ix[cover], iy[cover]), 1)
 
-    heights = np.zeros(shape)
+    heights = np.full(shape, np.nan)
     flat = ix * shape[1] + iy
     order = np.lexsort((points[:, 2], flat))
     flat, z = flat[order], points[order, 2]
@@ -489,8 +590,32 @@ def occupancy_grid(points, cell, min_hits, percentile):
             np.percentile(z[start:stop], percentile)
 
     mask = counts >= min_hits
+    if close_iter > 0:
+        mask = ndimage.binary_closing(mask, structure=np.ones((3, 3), bool),
+                                      iterations=close_iter)
+    mask = ndimage.binary_fill_holes(mask)
+    # a grid cell with no point of its own takes the height of its
+    # neighbours (only matters for the filled holes)
+    if np.isnan(heights[mask]).any():
+        filled = heights.copy()
+        for _ in range(50):
+            hole = mask & np.isnan(filled)
+            if not hole.any():
+                break
+            padded = np.pad(filled, 1, constant_values=np.nan)
+            stack = np.stack([padded[1 + di:1 + di + shape[0],
+                                     1 + dj:1 + dj + shape[1]]
+                              for di in (-1, 0, 1) for dj in (-1, 0, 1)])
+            with np.errstate(all="ignore"), warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                guess = np.nanmax(stack, axis=0)
+            filled[hole] = guess[hole]
+        heights = filled
+
     centres, values = [], []
     for i, j in zip(*np.nonzero(mask)):
+        if np.isnan(heights[i, j]):
+            continue
         centres.append(((i + 0.5) * cell + x0, (j + 0.5) * cell + y0))
         values.append(heights[i, j])
     return np.array(centres), np.array(values)
@@ -528,32 +653,40 @@ def label_faces(faces, centres, values, cell, min_fill, min_area,
     return np.array(inside), np.array(heights)
 
 
-def quantize_heights(heights, inside, count, tolerance):
-    live = heights[inside]
+def quantize_heights(heights, inside, count, tolerance, areas=None):
+    """Snap cell heights to a few roof levels.
+
+    1D clustering: sort the heights and start a new level wherever the gap
+    to the previous height is larger than `tolerance`. Each level is the
+    area-weighted mean of its cells. The old histogram-peak method split
+    one roof into several levels (8.0, 11.1, 12.7 m ...) because a hipped
+    roof gives a slightly different height in every cell.
+    `count` is kept for the command line but is no longer needed.
+    """
+    live = np.flatnonzero(inside)
     if live.size == 0:
         raise SystemExit("no arrangement cell is inside the building")
+    if areas is None:
+        areas = np.ones(len(heights))
 
-    counts, edges = np.histogram(live, bins=60)
-    centers = 0.5 * (edges[:-1] + edges[1:])
-    peaks, _ = find_peaks(np.r_[0, counts, 0], distance=2)
-    peaks = [p - 1 for p in peaks if 0 <= p - 1 < len(centers)]
-    peaks.sort(key=lambda p: -counts[p])
-
-    levels = sorted(float(centers[p]) for p in peaks[:count])
-    if not levels:
-        levels = [float(np.median(live))]
-    if live.max() - max(levels) > tolerance:
-        levels.append(float(live.max()))
+    order = live[np.argsort(heights[live])]
+    groups, current = [], [order[0]]
+    for index in order[1:]:
+        if heights[index] - heights[current[-1]] > tolerance:
+            groups.append(current)
+            current = [index]
+        else:
+            current.append(index)
+    groups.append(current)
 
     snapped = heights.copy()
-    for index in np.flatnonzero(inside):
-        nearest = min(levels, key=lambda v: abs(v - heights[index]))
-        if abs(nearest - heights[index]) <= tolerance:
-            snapped[index] = nearest
-        else:
-            levels.append(float(heights[index]))
-            snapped[index] = heights[index]
-    return snapped, sorted(set(round(v, 3) for v in levels))
+    levels = []
+    for group in groups:
+        weight = areas[group]
+        level = float(np.sum(heights[group] * weight) / np.sum(weight))
+        snapped[group] = level
+        levels.append(round(level, 3))
+    return snapped, levels
 
 
 # --------------------------------------------------------------------------
@@ -648,8 +781,37 @@ def wall_frame(surface):
     return origin, horizontal, vertical, (min(a), max(a)), (min(b), max(b))
 
 
+def split_by_holes(piece, closed, min_hole=4):
+    """Split one patch that holds several closed outlines.
+
+    Doors and windows are often seen only as their frame. Filling the holes
+    turns a frame into a full rectangle, but two frames that touch become
+    one wide rectangle. When a patch has two or more holes, cut it between
+    them (along the wall), so each frame becomes its own opening.
+    """
+    holes, total = ndimage.label(piece & ~closed)
+    spans = []
+    for hole in range(1, total + 1):
+        rows = np.nonzero(holes == hole)[0]
+        if (holes == hole).sum() >= min_hole:
+            spans.append((rows.min(), rows.max()))
+    if len(spans) < 2:
+        return [piece]
+    spans.sort()
+    cuts = [(left[1] + right[0] + 1) // 2
+            for left, right in zip(spans, spans[1:])]
+    edges = [0] + cuts + [piece.shape[0]]
+    parts = []
+    for start, stop in zip(edges[:-1], edges[1:]):
+        part = np.zeros_like(piece)
+        part[start:stop] = piece[start:stop]
+        if part.any():
+            parts.append(part)
+    return parts
+
+
 def windows_on_walls(points, walls, band, cell, margin, min_size, min_points,
-                     reach):
+                     reach, tag="Win"):
     """Assign each glazing point to its nearest wall, then cut it up.
 
     reach: slack on the wall rectangle. A wall is one arrangement edge, so a
@@ -696,13 +858,16 @@ def windows_on_walls(points, walls, band, cell, margin, min_size, min_points,
         np.add.at(grid, (ia, ib), 1)
 
         mask = grid >= 1
-        mask = ndimage.binary_closing(mask, structure=np.ones((2, 2), bool))
-        mask = ndimage.binary_fill_holes(mask)
+        closed = ndimage.binary_closing(mask,
+                                        structure=np.ones((2, 2), bool))
+        mask = ndimage.binary_fill_holes(closed)
         labels, total = ndimage.label(mask, structure=np.ones((3, 3)))
 
         count = 0
+        pieces = []
         for region in range(1, total + 1):
-            piece = labels == region
+            pieces.extend(split_by_holes(labels == region, closed))
+        for piece in pieces:
             if grid[piece].sum() < min_points:
                 continue
             ri, ci = np.nonzero(piece)
@@ -723,12 +888,97 @@ def windows_on_walls(points, walls, band, cell, margin, min_size, min_points,
                     origin + ha * amax + va * bmin,
                     origin + ha * amax + va * bmax,
                     origin + ha * amin + va * bmax]
-            windows.append({"name": f"{wall['name']}_Win_{count:02d}",
+            windows.append({"name": f"{wall['name']}_{tag}_{count:02d}",
                             "wall": wall["name"],
+                            "rect": (amin, amax, bmin, bmax),
                             "vertices": orient(quad, wall["outward"]),
                             "area": (amax - amin) * (bmax - bmin)})
 
     return windows, {"unassigned": unassigned, "unassigned_points": orphans}
+
+
+def doors_on_walls(points, walls, band, cell, margin, min_size, min_points,
+                  reach, snap, max_height, min_height, tag="Door",
+                  ground_only=True):
+    """Doors are found like windows, on each wall's own plane, then:
+
+    - only walls that stand on the ground can hold a door;
+    - the bottom edge is snapped to the ground when it is within `snap`
+      metres of it (the segmentation rarely reaches the threshold);
+    - the door points must span at least `min_height` metres. The door
+      class also marks a few points on window sills; those short pieces
+      are not doors;
+    - a door taller than `max_height` is cut to that height (0 = no cap).
+    The same rules are used for the "opening" class (tag="Opening"), but
+    with ground_only=False: openings may sit high on a wall (the belfry of
+    the tower). They are still snapped to the ground when close to it.
+    """
+    ground_walls = [w for w in walls
+                    if not ground_only
+                    or min(v[2] for v in w["vertices"]) < 1e-3]
+    found, report = windows_on_walls(points, ground_walls, band, cell,
+                                     margin, min_size, min_points, reach,
+                                     tag=tag)
+    by_name = {w["name"]: w for w in walls}
+    doors = []
+    report["too_short"] = 0
+    report["off_ground"] = 0
+    for door in found:
+        wall = by_name[door["wall"]]
+        origin, ha, va, arange, brange = wall["frame"]
+        amin, amax, bmin, bmax = door["rect"]
+        if bmax - bmin < min_height:
+            report["too_short"] += 1
+            continue            # sill points under a window, not a door
+        if bmin - brange[0] <= snap and brange[0] < 1e-3:
+            bmin = brange[0]
+        elif ground_only:
+            report["off_ground"] += 1
+            continue            # a "door" floating in the facade: skip it
+        else:
+            bmin = max(bmin, brange[0] + margin)
+        if max_height > 0:
+            bmax = min(bmax, bmin + max_height)
+        bmax = min(bmax, brange[1] - margin)
+        if bmax - bmin < min_size:
+            continue
+        quad = [origin + ha * amin + va * bmin,
+                origin + ha * amax + va * bmin,
+                origin + ha * amax + va * bmax,
+                origin + ha * amin + va * bmax]
+        door.update({"kind": "Door", "construction": "ExtDoor",
+                     "rect": (amin, amax, bmin, bmax),
+                     "vertices": orient(quad, wall["outward"]),
+                     "area": (amax - amin) * (bmax - bmin)})
+        doors.append(door)
+
+    # number the doors again, one series per wall
+    count = defaultdict(int)
+    for door in doors:
+        count[door["wall"]] += 1
+        door["name"] = f"{door['wall']}_{tag}_{count[door['wall']]:02d}"
+    return doors, report
+
+
+def drop_overlaps(windows, doors, gap=0.05):
+    """Remove every item of `windows` that overlaps an item of `doors` on
+    the same wall. The second list has priority. Order used in main():
+    windows > doors > openings."""
+    keep = []
+    for window in windows:
+        wa0, wa1, wb0, wb1 = window["rect"]
+        hit = False
+        for door in doors:
+            if door["wall"] != window["wall"]:
+                continue
+            da0, da1, db0, db1 = door["rect"]
+            if (wa0 < da1 + gap and da0 < wa1 + gap
+                    and wb0 < db1 + gap and db0 < wb1 + gap):
+                hit = True
+                break
+        if not hit:
+            keep.append(window)
+    return keep
 
 
 # --------------------------------------------------------------------------
@@ -802,9 +1052,16 @@ def column_shades(points, eps, min_points, min_height, max_width,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--envelope", required=True)
+    parser.add_argument("--envelope", required=True, nargs="+",
+                        help="one or more clouds of the building shell, "
+                             "e.g. --envelope wall.ply roof.ply")
     parser.add_argument("--windows", default=None)
     parser.add_argument("--columns", default=None)
+    parser.add_argument("--doors", default=None,
+                        help="door cloud, e.g. --doors door.ply")
+    parser.add_argument("--openings", default=None,
+                        help="opening cloud, treated like doors, "
+                             "e.g. --openings opening.ply")
     parser.add_argument("--dirs", default=None)
     parser.add_argument("--out", default="building.idf")
     parser.add_argument("--height", type=float, required=True)
@@ -823,7 +1080,10 @@ def main():
     parser.add_argument("--cell", type=float, default=0.6,
                         help="occupancy sampling cell, metres")
     parser.add_argument("--min-hits", type=int, default=4)
-    parser.add_argument("--min-fill", type=float, default=0.35,
+    parser.add_argument("--roof-angle", type=float, default=50.0,
+                        help="a point is roof-like when its normal is "
+                             "within this many degrees of vertical")
+    parser.add_argument("--min-fill", type=float, default=0.5,
                         help="share of a cell that must hold points")
     parser.add_argument("--min-cell-area", type=float, default=1.0)
     parser.add_argument("--top-percentile", type=float, default=95.0,
@@ -845,11 +1105,50 @@ def main():
                         help="write the glazing points that found no wall, "
                              "e.g. --orphans orphans.ply")
 
-    parser.add_argument("--column-eps", type=float, default=0.5)
-    parser.add_argument("--column-min-points", type=int, default=60)
+    parser.add_argument("--door-band", type=float, default=1.5)
+    parser.add_argument("--door-cell", type=float, default=0.25)
+    parser.add_argument("--door-margin", type=float, default=0.1)
+    parser.add_argument("--door-min-size", type=float, default=0.6)
+    parser.add_argument("--door-min-points", type=int, default=20)
+    parser.add_argument("--door-reach", type=float, default=0.5)
+    parser.add_argument("--door-snap", type=float, default=1.5,
+                        help="snap the door bottom to the ground when it is "
+                             "closer than this, metres; doors higher up "
+                             "are skipped")
+    parser.add_argument("--opening-band", type=float, default=4.0,
+                        help="how far, metres, an opening point may be "
+                             "from its wall. Larger than for doors: the "
+                             "arcade entrances sit back behind the facade")
+    parser.add_argument("--door-min-height", type=float, default=1.8,
+                        help="door points must span at least this height")
+    parser.add_argument("--door-max-height", type=float, default=0.0,
+                        help="cap the door height, metres (0 = no cap)")
+
+    parser.add_argument("--column-eps", type=float, default=1.0)
+    parser.add_argument("--column-min-points", type=int, default=30)
     parser.add_argument("--column-min-height", type=float, default=2.0)
     parser.add_argument("--column-max-width", type=float, default=2.5)
     parser.add_argument("--column-slenderness", type=float, default=1.5)
+
+    parser.add_argument("--no-clean", action="store_true",
+                        help="skip the noise removal on the input clouds")
+    parser.add_argument("--clean-neighbours", type=int, default=20)
+    parser.add_argument("--clean-std", type=float, default=2.0)
+    parser.add_argument("--clean-eps", type=float, default=6.0,
+                        help="DBSCAN radius, in multiples of the point "
+                             "spacing, for keeping the main building")
+    parser.add_argument("--clean-reach", type=float, default=2.0,
+                        help="windows and columns farther than this, in "
+                             "metres, from the shell are dropped")
+    parser.add_argument("--min-height", type=float, default=3.0,
+                        help="cells lower than this (steps, ground noise) "
+                             "are treated as outside")
+    parser.add_argument("--ground-percentile", type=float, default=0.5)
+    parser.add_argument("--top-height-percentile", type=float, default=99.9)
+
+    parser.add_argument("--cloud-north", type=float, default=0.0,
+                        help="compass bearing (deg, clockwise from true "
+                             "north) of the point cloud's +Y axis")
 
     parser.add_argument("--preview", default=None)
     parser.add_argument("--preview-cloud", default=None)
@@ -858,31 +1157,61 @@ def main():
     parser.add_argument("--version", default="24.1")
     args = parser.parse_args()
 
-    envelope = load_points(args.envelope)
+    envelope = load_many(args.envelope)
     glazing = load_points(args.windows)
     columns = load_points(args.columns)
+    doors_pts = load_points(args.doors)
+    open_pts = load_points(args.openings)
     if len(envelope) == 0:
         raise SystemExit(f"no points in {args.envelope}")
     print(f"envelope {len(envelope)}  windows {len(glazing)}  "
-          f"columns {len(columns)}")
+          f"columns {len(columns)}  doors {len(doors_pts)}  "
+          f"openings {len(open_pts)}")
+
+    if not args.no_clean:
+        raw = len(envelope)
+        envelope, spacing = clean_envelope(envelope, args.clean_neighbours,
+                                           args.clean_std, args.clean_eps)
+        print(f"after cleaning: envelope {len(envelope)} "
+              f"({raw - len(envelope)} noise points removed)")
 
     rotation, north = building_frame(read_directions(args.dirs), envelope)
     envelope = envelope @ rotation.T
     glazing = glazing @ rotation.T if len(glazing) else glazing
     columns = columns @ rotation.T if len(columns) else columns
+    doors_pts = doors_pts @ rotation.T if len(doors_pts) else doors_pts
+    open_pts = open_pts @ rotation.T if len(open_pts) else open_pts
 
-    span = envelope[:, 2].max() - envelope[:, 2].min()
+    # robust ground and top: a few stray points must not set the scale
+    ground = float(np.percentile(envelope[:, 2], args.ground_percentile))
+    top = float(np.percentile(envelope[:, 2], args.top_height_percentile))
+    span = top - ground
     scale = args.height / span
-    origin = np.array([envelope[:, 0].min(), envelope[:, 1].min(),
-                       envelope[:, 2].min()])
+    origin = np.array([envelope[:, 0].min(), envelope[:, 1].min(), ground])
     envelope = (envelope - origin) * scale
+    envelope = envelope[envelope[:, 2] >= -0.5]   # below ground = noise
     glazing = (glazing - origin) * scale if len(glazing) else glazing
     columns = (columns - origin) * scale if len(columns) else columns
+    doors_pts = (doors_pts - origin) * scale if len(doors_pts) else doors_pts
+    open_pts = (open_pts - origin) * scale if len(open_pts) else open_pts
+    if not args.no_clean:
+        # windows sit in holes of the wall cloud, so measure in metres
+        n_glass, n_col = len(glazing), len(columns)
+        glazing = near_building(glazing, envelope, args.clean_reach)
+        columns = near_building(columns, envelope, args.clean_reach)
+        n_door = len(doors_pts)
+        doors_pts = near_building(doors_pts, envelope, args.clean_reach)
+        n_open = len(open_pts)
+        open_pts = near_building(open_pts, envelope, args.clean_reach)
+        print(f"kept doors {len(doors_pts)}/{n_door}  "
+              f"openings {len(open_pts)}/{n_open} near the shell")
+        print(f"kept windows {len(glazing)}/{n_glass}  "
+              f"columns {len(columns)}/{n_col} near the shell")
     print(f"north axis {north:.2f} deg, scale {scale:.3f} "
           f"(height {args.height:.1f} m)")
 
-    facade_points = envelope if len(glazing) == 0 else \
-        np.vstack([envelope, glazing])
+    facade_points = np.vstack([p for p in (envelope, glazing, doors_pts,
+                                           open_pts) if len(p)])
 
     spacing = args.cell / 3.0
     normals = estimate_normals(facade_points, radius=max(spacing, 0.25) * 3)
@@ -901,13 +1230,22 @@ def main():
     faces = arrangement(lines, bounds, margin=2.0)
     print(f"arrangement cells {len(faces)}")
 
+    # roof-like points (normal close to vertical) decide what is inside
+    sky = np.abs(normals[:, 2]) >= np.cos(np.deg2rad(args.roof_angle))
     centres, values = occupancy_grid(facade_points, args.cell, args.min_hits,
-                                     args.top_percentile)
+                                     args.top_percentile, cover=sky)
     inside, heights = label_faces(faces, centres, values, args.cell,
                                   args.min_fill, args.min_cell_area,
                                   args.cell_percentile)
     heights, levels = quantize_heights(heights, inside, args.levels,
-                                       args.level_tolerance)
+                                       args.level_tolerance,
+                                       np.array([f.area for f in faces]))
+    low = inside & (heights < args.min_height)
+    if low.any():
+        print(f"dropped {int(low.sum())} cells lower than "
+              f"{args.min_height} m")
+        inside = inside & ~low
+        levels = sorted(set(round(float(h), 3) for h in heights[inside]))
     footprint = sum(f.area for f, keep in zip(faces, inside) if keep)
     print(f"inside cells {int(inside.sum())}, footprint {footprint:.0f} m2")
     print(f"levels {[round(v, 1) for v in levels]} m")
@@ -940,6 +1278,36 @@ def main():
                            {"window": report["unassigned_points"]})
         print(f"  wrote {args.orphans}")
 
+    # priority when two masks overlap on a wall: windows > doors > openings
+    doors, door_report = doors_on_walls(
+        doors_pts, walls, args.door_band, args.door_cell, args.door_margin,
+        args.door_min_size, args.door_min_points, args.door_reach,
+        args.door_snap, args.door_max_height, args.door_min_height)
+    if len(doors_pts):
+        found = len(doors)
+        doors = drop_overlaps(doors, placed)
+        hosts = len({d["wall"] for d in doors})
+        print(f"doors {len(doors)} placed on {hosts} walls; "
+              f"{found - len(doors)} removed because a window is there; "
+              f"skipped {door_report['too_short']} too short, "
+              f"{door_report['off_ground']} off the ground "
+              f"({door_report['unassigned']} points found no wall)")
+
+    gaps, gap_report = doors_on_walls(
+        open_pts, walls, args.opening_band, args.door_cell, args.door_margin,
+        args.door_min_size, args.door_min_points, args.door_reach,
+        args.door_snap, args.door_max_height, args.door_min_height,
+        tag="Opening", ground_only=False)
+    if len(open_pts):
+        found = len(gaps)
+        gaps = drop_overlaps(gaps, placed + doors)
+        hosts = len({d["wall"] for d in gaps})
+        print(f"openings {len(gaps)} placed as doors on {hosts} walls; "
+              f"{found - len(gaps)} removed because a window or door is "
+              f"there; skipped {gap_report['too_short']} too short "
+              f"({gap_report['unassigned']} points found no wall)")
+    openings = placed + doors + gaps
+
     shades, rejected, measured = column_shades(
         columns, args.column_eps, args.column_min_points,
         args.column_min_height, args.column_max_width,
@@ -958,16 +1326,25 @@ def main():
               f"median {np.median(wide):.1f}  max {wide.max():.1f}"
               f"   (--column-max-width {args.column_max_width})")
 
-    write_idf(args.out, surfaces, placed, shades, args.zone, north,
+    # The geometry is written in the building frame (X = long axis). To put
+    # it back to its real orientation, EnergyPlus must turn it clockwise by
+    # -north (north is the counter-clockwise angle of the long axis in the
+    # cloud). --cloud-north is the compass bearing of the cloud's +Y axis;
+    # 0 means the cloud's +Y already points to true north.
+    north_axis = (-north + args.cloud_north) % 360.0
+    print(f"Building North Axis {north_axis:.2f} deg "
+          f"(cloud +Y assumed at bearing {args.cloud_north:.1f} deg)")
+    write_idf(args.out, surfaces, openings, shades, args.zone, north_axis,
               args.version, args.name)
     print(f"\nwrote {args.out}")
     if args.preview:
-        write_preview(args.preview, surfaces, placed, shades)
+        write_preview(args.preview, surfaces, openings, shades)
         print(f"wrote {args.preview}")
     if args.preview_cloud:
         write_scaled_cloud(args.preview_cloud,
                            {"envelope": envelope, "window": glazing,
-                            "column": columns})
+                            "column": columns, "door": doors_pts,
+                            "opening": open_pts})
         print(f"wrote {args.preview_cloud}")
 
 
